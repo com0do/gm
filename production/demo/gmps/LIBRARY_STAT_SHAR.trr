@@ -1,0 +1,123 @@
+/*[ Makefile -------------------------------------------------------------------
+
+  Component   	  : SW Generation
+
+  Name            : LIBRARY_STAT_SHAR.trr - library generation rules
+
+  Author          : R.Girst
+
+  Language        : imake
+
+  Description     :
+	This file contains all macros needed for the building of a
+        static and a shared library.
+
+------------------------------------------------------------------------------ */
+/*] END */
+
+
+#define LIBRARY_STAT_SHAR(LibName)				@@\
+								@@\
+GMPS_Target = DOTARGETPATH/LibName.a DOTARGETPATH/LibName.so	@@\
+								@@\
+LibName :: $(GMPS_Target)					@@\
+								@@\
+SRC    = /iSOURCEPATH						@@\
+GMKFIL = $(SRC)/LibName.gmk 					@@\
+GMKOPT = $(SRC)/LibName.options					@@\
+MKFIL  = DODIRPATH/LibName.mk 					@@\
+DEPS   = $(GMKFIL) $(MKFIL)					@@\
+								@@\
+ifeq "$(GMS_PREPROC)" "YES"					@@\
+  PreProcList = $(PreProcs)					@@\
+else                                                           	@@\
+  RM_ifiles = $(RM) -f *.i					@@\
+endif                                                          	@@\
+								@@\
+ifeq ($(DEP_TREE), yes) @@\
+LIB_DEP_SUFFIX = $(if $(filter $(basename $(notdir $(word 2,$(GMPS_Target)))).o,$(notdir $(Objs))),lib.dep.json,dep.json) @@\
+endif @@\
+								@@\
+clean ::							@@\
+	$(RM) -f DOTARGETPATH/LibName.a				@@\
+	$(RM) -f $(Objs) *.o *.i *.json				@@\
+	$(RM) -f LibName.mk LibName.options			@@\
+	$(RM) -f LibName.info do.lst .cmake.state		@@\
+	$(RM) -rf LibName.a SunWS_cache 			@@\
+ 								@@\
+DOTARGETPATH/LibName.a : $(DEPS) \				@@\
+			 $(LEXYACCTARGET) $(GENTOOLTARGET) \	@@\
+			 $(Objs) \				@@\
+			 $(if $(filter yes,$(DEP_TREE)),$(Objs:.o=.dep.json)) \	@@\
+			 | DOTARGETPATH/LibName.so		@@\
+	@$(ECHO) ...						@@\
+	@$(ECHO) ... Build the Static Library $@		@@\
+	@$(ECHO) ...						@@\
+	@$(RM) -rf $@ LibName.a ; $(RM_ifiles)			@@\
+	$(AR) $(ARflags_local) $(ARflags) LibName.a $(Objs) \	@@\
+		$(ObjsCache)					@@\
+	@$(RM) -f $@; $(LN) DODIRPATH/LibName.a $@ 		@@\
+	@-if [ -f $(GMKOPT) ]; then $(CAT) $(GMKOPT)>/dev/null; fi @@\
+								@@\
+								@@\
+SHARED_OPT = -shared -Wl,--soname,LibName.so 					@@\
+#SHARED_OPT = -shared            				@@\
+								@@\
+clean ::							@@\
+	$(RM) -f DOTARGETPATH/LibName.so			@@\
+	$(RM) -f $(Objs)					@@\
+	$(RM) -f LibName.mk LibName.options 			@@\
+	$(RM) -f LibName.info do.lst .cmake.state		@@\
+	$(RM) -rf LibName.so 		 			@@\
+ 								@@\
+DOTARGETPATH/LibName.so : $(Objs) $(DEPS) $(PreProcList) \	@@\
+			      $(if $(filter yes,$(DEP_TREE)),$(Objs:.o=.dep.json))	@@\
+	@$(ECHO) ...						@@\
+	@$(ECHO) ... Build the Shared Library $@		@@\
+	@$(ECHO) ...						@@\
+	@$(RM) -rf $@ LibName.so ; $(RM_ifiles)			@@\
+	$(LD) -o LibName.so $(SHARED_OPT) $(LDflags_local) \	@@\
+	    $(LDflags) $(Objs) $(LDObjects) $(LDLibs)  \	@@\
+	    $(LDflags_options) 					@@\
+	@$(RM) -f $@; $(LN) DODIRPATH/LibName.so $@ 		@@\
+	@if [ "$(Catch_DIR_PATTERN)" ]; then \			@@\
+	   $(ECHO) ...			 ;\			@@\
+	   $(ECHO) ... Directory Catcher ;\			@@\
+	   $(ECHO) ...			 ;\			@@\
+	  Catch="$(Catch_DIR_PATTERN)"	 ;\			@@\
+	  for i in $$Catch; do \				@@\
+	    dir=`$(ECHO) $$i | $(AWK) -F: '{print $$1}'`     ;\	@@\
+	    pattern=`$(ECHO) $$i | $(AWK) -F: '{print $$2}'` ;\	@@\
+	    if [ "$$pattern" ]; then \				     @@\
+	       cmd="$(GMPSHOME)/bin/gms_catcher $$dir '$$pattern'";\ @@\
+	    else \						     @@\
+	       cmd="$(GMPSHOME)/bin/gms_catcher $$dir"; fi ; \	     @@\
+	    $(ECHO) $$cmd; eval $$cmd	     ;\			@@\
+	    if [ $$? != 0 ]; then $(RM) -f $@; exit 1; fi ;\	@@\
+	  done ;\						@@\
+	fi  							@@\
+	@if [ "$(Catch_FILE)" ]; then \				@@\
+	   $(ECHO) ...		    ;\				@@\
+	   $(ECHO) ... File Catcher ;\				@@\
+	   $(ECHO) ...		    ;\				@@\
+	  for i in "$(Catch_FILE)"; do \			@@\
+	    cmd="$(GMPSHOME)/bin/gms_file_catcher $$i" 	  ;\	@@\
+	    $(ECHO) $$cmd; $$cmd	    		  ;\	@@\
+	    if [ $$? != 0 ]; then $(RM) -f $@; exit 1; fi ;\	@@\
+	  done ;\						@@\
+	fi  							@@\
+ifeq ($(DEP_TREE), yes) @@\
+ifneq ($(strip $(Objs)),) @@\
+	@LIB_DEPS="$$($(DEPCXX) $(LDflags_local) $(LDflags) $(LDLibs) $(LDflags_options) | tr '\n' ' ')"; \ @@\
+	jq -s --arg LIB_DEPS "$$LIB_DEPS" --arg GMK_FILE "$(GMKFIL)" \ @@\
+	   '{file: "'$@'", deps: (map(select(.file|endswith(".o"))|.deps[]) + ($$LIB_DEPS|split(" ")|map(select(length>0))) + [$$GMK_FILE] | unique|sort)}' \ @@\
+	   $(Objs:.o=.dep.json) > LibName.$(LIB_DEP_SUFFIX) ;\ @@\
+	$(RM) -rf $(basename $@).dep.json $(basename $@).lib.dep.json ;\ @@\
+	$(LN) DODIRPATH/LibName.$(LIB_DEP_SUFFIX) $(basename $@).$(LIB_DEP_SUFFIX) @@\
+	@$(ECHO) "Generated $(basename $@).$(LIB_DEP_SUFFIX)" @@\
+endif @@\
+endif @@\
+
+#include "ARFLAGS.trr"
+#include "LDFLAGS.trr"
+
