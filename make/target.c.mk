@@ -111,10 +111,10 @@ endif
 $(if $(filter bin,$(TARGET_TYPE)),$(BUILD_DIR)/$(TARGET),$(BUILD_DIR)/$(TARGET).so) : $(Objs) \
                 $(if $(filter bin,$(TARGET_TYPE)),$(LDLIBS)) | $(BUILD_DIR)
 	@$(ECHO) ...
-	@$(ECHO) ... Build the Shared Library $(@F)
+	@$(ECHO) ... Build the $(if $(filter bin,$(TARGET_TYPE)),Binary,Shared Library) $(@F)
 	@$(ECHO) ...
 	@Cmd="$(LD_CMD)";\
-	$(ECHO) "\\t$$Cmd"; eval $$Cmd
+	$(ECHO) "$$Cmd"; eval $$Cmd
 
 $(TARGET_PATH) : $(OUT_DIR)/% : $(BUILD_DIR)/% | $(OUT_DIR)
 	$(LN) $(BUILD_DIR)/$(@F) $@

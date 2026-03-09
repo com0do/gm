@@ -1,0 +1,117 @@
+commit 90b7b0de5f3434f0b543d9f8fd82554adc3b7f9c
+Author: cyrus.cui <cyrus.cui@nokia-sbell.com>
+Date:   Fri Jun 30 12:41:40 2023 +0800
+
+    UDMT-6494:5G docking Makefile system for HSS.
+    
+    Change-Id: I083e0e88e41f61298da297c5fa0c09498c30c274
+
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 00000000000..91049c3001e
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,4 @@
++
++gms_make.tmp
++gmlog.*
++.vscode
+diff --git a/gmps/etc/ims/rhlinux/gms_config b/gmps/etc/ims/rhlinux/gms_config
+index c58c2ee8a06..91640df0d1e 100755
+--- a/gmps/etc/ims/rhlinux/gms_config
++++ b/gmps/etc/ims/rhlinux/gms_config
+@@ -515,6 +515,9 @@ Suffix		NO
+ 
+ #########################################################################
+ 
++# The C/C++ Compiler accelerator
++#
++@CCACHE_PATH		$GMPS_TOP_tools/ccache-4.8-linux-x86_64/ccache
+ 
+ # The C Compiler
+ #
+diff --git a/production/bin/versionparser b/production/bin/versionparser
+index 97791d5f479..85ff6e7dcfe 100755
+--- a/production/bin/versionparser
++++ b/production/bin/versionparser
+@@ -1,35 +1,35 @@
+ #!/usr/bin/env perl
+ 
+-BEGIN
+-{
+-#  $gmps_top = "/git_wc/WorkCopy/thimmaia/ims";
+-  $gmps_top = $ENV{'GMPS_TOP'};
+-   $adv_hss  = $ENV{'ADVANTAGE_HSS'};
+-
+-   $osName = `uname -s`;
+-   chomp($osName);
+-
+-   if ($osName =~ /Linux/)
+-   {
+-	   my $perl_vers="5.8.9" ;
+-
+-	   unshift(@INC, "${gmps_top}_tools/rhlinux/perl/lib/$perl_vers/x86_64-linux");
+-	   unshift(@INC, "${gmps_top}_tools/rhlinux/perl/lib/$perl_vers");
+-	   unshift(@INC, "${gmps_top}_tools/rhlinux/perl/lib/site_perl/$perl_vers/x86_64-linux"); 
+-	   unshift(@INC, "${gmps_top}_tools/rhlinux/perl/lib/site_perl/$perl_vers"); 
+-	   unshift(@INC, "${gmps_top}_tools/rhlinux/perl/lib/site_perl");   
+-   }
+-   elsif ($osName =~ /SunOS/)
+-   {
+-	   my $perl_vers="5.8.0" ;
+-
+-	   unshift(@INC, "${gmps_top}_tools/sol/perl/lib/$perl_vers/sun4-solaris");
+-	   unshift(@INC, "${gmps_top}_tools/sol/perl/lib/$perl_vers");
+-	   unshift(@INC, "${gmps_top}_tools/sol/perl/lib/site_perl/$perl_vers/sun4-solaris"); 
+-	   unshift(@INC, "${gmps_top}_tools/sol/perl/lib/site_perl/$perl_vers"); 
+-	   unshift(@INC, "${gmps_top}_tools/sol/perl/lib/site_perl");
+-   }
+-}
++$gmps_top = $ENV{'GMPS_TOP'};
++$adv_hss  = $ENV{'ADVANTAGE_HSS'};
++#BEGIN
++#{
++##  $gmps_top = "/git_wc/WorkCopy/thimmaia/ims";
++#
++#   $osName = `uname -s`;
++#   chomp($osName);
++#
++#   if ($osName =~ /Linux/)
++#   {
++#	   my $perl_vers="5.8.9" ;
++#
++#	   unshift(@INC, "${gmps_top}_tools/rhlinux/perl/lib/$perl_vers/x86_64-linux");
++#	   unshift(@INC, "${gmps_top}_tools/rhlinux/perl/lib/$perl_vers");
++#	   unshift(@INC, "${gmps_top}_tools/rhlinux/perl/lib/site_perl/$perl_vers/x86_64-linux"); 
++#	   unshift(@INC, "${gmps_top}_tools/rhlinux/perl/lib/site_perl/$perl_vers"); 
++#	   unshift(@INC, "${gmps_top}_tools/rhlinux/perl/lib/site_perl");   
++#   }
++#   elsif ($osName =~ /SunOS/)
++#   {
++#	   my $perl_vers="5.8.0" ;
++#
++#	   unshift(@INC, "${gmps_top}_tools/sol/perl/lib/$perl_vers/sun4-solaris");
++#	   unshift(@INC, "${gmps_top}_tools/sol/perl/lib/$perl_vers");
++#	   unshift(@INC, "${gmps_top}_tools/sol/perl/lib/site_perl/$perl_vers/sun4-solaris"); 
++#	   unshift(@INC, "${gmps_top}_tools/sol/perl/lib/site_perl/$perl_vers"); 
++#	   unshift(@INC, "${gmps_top}_tools/sol/perl/lib/site_perl");
++#   }
++#}
+ 
+ use XML::LibXML;
+ 
+@@ -308,11 +308,11 @@ foreach my $node (@nodes)
+ {
+   my $name   = $node->getAttribute("ComponentName");
+   my $struct = $node->getAttribute("ComponentStructure");
+-  $struct =~ s/\${GMPS_TOP}/$gmps_top/g;
++  $struct =~ s/\$\{GMPS_TOP\}/$gmps_top/g;
+   $struct =~ s/\$GMPS_TOP/$gmps_top/g;
+-  $struct =~ s/\${ADVANTAGE_HSS}/$adv_hss/g;
++  $struct =~ s/\$\{ADVANTAGE_HSS\}/$adv_hss/g;
+   $struct =~ s/\$ADVANTAGE_HSS/$adv_hss/g;
+-  $struct =~ s/\${ADVANTAGE_HLRI}/$adv_hss/g;
++  $struct =~ s/\$\{ADVANTAGE_HLRI\}/$adv_hss/g;
+   $struct =~ s/\$ADVANTAGE_HLRI/$adv_hss/g;
+ 
+   if ($name =~ /^platform\//)
