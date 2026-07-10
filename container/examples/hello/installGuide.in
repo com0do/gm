@@ -1,0 +1,8 @@
+[START]
+[RPMINSTALL]
+vim-minimal
+[RUN]
+mkdir -p /usr/local/bin
+cp /root/container/hello.sh /usr/local/bin/hello.sh
+chmod 0755 /usr/local/bin/hello.sh
+[STOP]

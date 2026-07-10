@@ -1,2 +1,6 @@
 
-build/*
+build/
+*.pyc
+.cache/
+__pycache__/
+compile_commands.json

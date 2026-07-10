@@ -1,0 +1,66 @@
+# A minimal container image manifest.
+#
+# Demonstrates all runtime-construction features:
+#   1. dynamic yum.repo generation via {var} substitution in repos[].url
+#   2. dynamic rpm-lock generation via rpm_lock: block (auto-lock at build)
+#   3. extras[] with per-entry rename via {src, dst} dict form
+#   4. swappable in-container installer via installer: (defaults to
+#      the framework's shared templates/appDockerInstaller.sh)
+
+name:        hello
+version:     1.0.0
+base:        registry.access.redhat.com/ubi8/ubi-minimal:8.10
+registry:    localhost
+entrypoint:  /usr/local/bin/hello.sh
+
+# 4. Swappable installer.  Falls back to the framework default when
+#    omitted.  Set to `null` to skip staging one entirely (Dockerfile
+#    must not reference /root/container/appDockerInstaller.sh then).
+# installer: templates/appDockerInstaller.sh    # (default)
+
+# "Prep container runtime" packages -- installed BEFORE installGuide.in
+# blocks run.  Empty is fine; user can also just list them
+# in installGuide.in [RPMINSTALL].
+prerequisites:
+  - tar
+  - findutils
+  - gzip
+
+# Variables substitutable into repos[].url AND the Dockerfile template.
+vars:
+  greeting: "Hello, container"
+
+# Container-runtime DSL.  The interpreter runs this inside the first
+# build stage.
+install:
+  file: installGuide.in
+
+# 3. Files AND directories copied into the build context.  Two YAML
+#    forms:  bare string (dst = basename)  or  {src, dst} (rename).
+extras:
+  - hello.sh                                # plain file, same name
+  - src: scripts/                           # whole directory
+    dst: runtime-scripts/                   # renamed on the way in
+  - conf/                                   # plain directory
+  - src: hello.sh                           # same file staged twice,
+    dst: aliases/greeting.sh                # under a renamed alias
+
+# Manual RPM version pins.  Also feeds the rpm_lock generator below.
+override_rpms:
+  - [openssl, "1.1.1k", "14.el8_10", x86_64]
+
+# 2. Optional auto-generated per-image RPM version-lock.
+#    When present, `container build` generates versionlock.list into
+#    the build context using override.rpm.info (if declared) + yum
+#    lookups, then the in-container installer uses yum-plugin-
+#    versionlock to pin versions.  Set auto: false to require the
+#    explicit --rpm-lock CLI arg instead.
+# rpm_lock:
+#   override: override.rpm.info
+#   auto:     true
+
+# Pass-through metadata.  Anything listed here lands verbatim in
+# dep.json's `extra:` object.
+extra:
+  docker_source_path: ./examples/hello/
+  version_string:     hello/1.0.0

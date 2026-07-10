@@ -1,0 +1,55 @@
+# yaml-language-server: $schema=../../../production/make/schemas/pkg.schema.yaml
+#
+# example/p2 -- pkg spec.  Every optional field falls back to
+# pkg.schema.yaml's `default:`; `pkg` and `files` are the only fields
+# a minimal spec must declare.
+
+pkg:         pkg-p2
+description: gm sample RPM (t3 exe + libt2 shared lib + a config)
+rpm_deps:    [pkg-p1]
+
+# major / minor default to "1" / "0" (schema).  install_root defaults
+# to /opt/gm.  pkg_type defaults to full_product.  Uncomment to override.
+#
+# major:        '1'
+# minor:        '0'
+# pkg_type:     full_product
+# install_root: /opt/gm
+
+component:
+  name:      gm/example/p2
+  id:        '000.001.000.000.000.000'
+  comp_type: application
+
+files:
+  Binaries64:
+    - $GM_EXEC_DIR/t3
+  Impl_Libraries64:
+    - $GM_LIB_DIR/libt2.so
+  Config_OS:
+    - $PROJ_TOP/example/p2/config/p2.conf
+    - src:   $PROJ_TOP/example/p2/deployment/pkgscripts/p2-post-install.sh
+      mode:  '0755'
+      owner: root
+      group: root
+
+alarms:
+  - name:              P2ConfigMissing
+    number:            '4901'
+    alarm_type:        PROCESSING
+    severity:          MAJOR
+    suppression_time:  '60'
+    short_text:        pkg-p2 startup could not locate its config file
+    long_text: |
+      The pkg-p2 process failed to open its configuration file at startup.
+      Downstream traffic-serving features are unavailable until the file is restored.
+    repair_text:       Verify /etc/pkg-p2/p2.conf is present and readable by the service account; restart pkg-p2.
+
+  - name:              P2BackendUnreachable
+    number:            '4902'
+    alarm_type:        COMMUNICATION
+    severity:          WARNING
+    suppression_time:  '30'
+    short_text:        pkg-p2 lost contact with its upstream
+    long_text:         pkg-p2 could not reach its upstream service within the configured timeout window.
+    repair_text:       Check network reachability and upstream service health.

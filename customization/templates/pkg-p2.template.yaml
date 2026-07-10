@@ -1,0 +1,39 @@
+# cmproxy template for pkg-p2.
+#
+# Loaded by the `cmproxy` sidecar in every container that hosts a
+# pkg-p2 process.  cmproxy uses it to answer pkg-p2's config queries
+# against the central `generic.yaml`.
+#
+# Anatomy:
+#   - `pkg` identifies which pkg this template serves.
+#   - `schema` points at the yang module that defines the query
+#     namespace (relative to customization/ root).
+#   - `map` is the query-to-generic-path mapping.  A pkg process
+#     calls `gm_cmproxy_get(h, "<query>")` and cmproxy resolves the
+#     corresponding path in generic.yaml.
+#   - `access` is a coarse-grained read/write policy.  In this demo
+#     everything is read-only; a real deployment might allow
+#     operator-tools to POST changes to specific subtrees.
+
+pkg:     pkg-p2
+schema:  yang/pkg-p2/pkg-p2.yang
+
+# Where in generic.yaml the pkg's own tree lives.  cmproxy walks from
+# here for every query -- so `gm_cmproxy_get(h, "backend/host")` on
+# pkg-p2's side turns into `generic.yaml`'s `pkg-p2.config.backend.host`.
+mount:   pkg-p2/config
+
+# Optional: query aliases.  Lets code use short, stable names even if
+# the underlying generic.yaml layout shifts.
+aliases:
+  # short-name          →  path (relative to mount)
+  BACKEND_URL:            "backend/host"
+  BACKEND_TIMEOUT_MS:     "backend/timeout-ms"
+  MAX_INFLIGHT:           "max-inflight"
+  FEATURE_X:              "feature-flag-experimental-x"
+
+access:
+  # A `deny` list wins over the (implicit) allow-all read.  pkg-p2 is
+  # never allowed to see other pkgs' trees, only its own mount.
+  read:  [pkg-p2/config]
+  write: []              # runtime writes not allowed for this template

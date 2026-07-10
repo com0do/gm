@@ -1,0 +1,18 @@
+/*
+ * t1_buildinfo.h - auto-generated from t1_buildinfo.h.in
+ *
+ * @VAR@ tokens are substituted by make/target.c.mk's header-gen rule.
+ * To add a custom var, append its name to HEADER_GEN_VARS in libt1.mk.
+ */
+#ifndef T1_BUILDINFO_H
+#define T1_BUILDINFO_H
+
+#define T1_TARGET     "@TARGET@"
+#define T1_VERSION    "@PROJECT_VERSION@"
+#define T1_VENDOR     "@VENDOR@"
+#define T1_BUILD_MODE "@BUILD_MODE@"
+#define T1_BUILD_ARCH "@BUILD_ARCH@"
+#define T1_BUILD_DATE "@BUILD_DATE@"
+#define T1_BUILD_HOST "@BUILD_HOST@"
+
+#endif

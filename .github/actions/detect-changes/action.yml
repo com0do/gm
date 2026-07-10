@@ -1,0 +1,131 @@
+name: Detect affected areas
+description: >-
+  Thin wrapper around `dorny/paths-filter` that maps a PR's changed
+  files onto gm's CI lanes (build, tests, container, python, shell,
+  docs, ci).  On non-PR events (push, workflow_dispatch, schedule)
+  every lane is 'true' -- post-merge validation is never weakened.
+
+  We considered a bespoke Python classifier here (an earlier revision
+  shipped one).  `dorny/paths-filter` won because:
+    * it's the ecosystem standard, always current with the checkout
+      action and GitHub's compare API;
+    * lane definitions are declarative YAML instead of parallel-
+      structured Python -- easier to grep, review, and modify;
+    * the fail-open cascade (ci-lane touched -> everything runs) is
+      cleanly expressible with a job-level `if:` in the orchestrator.
+
+  Cascade rule: a job that legitimately depends on the build lane
+  should gate on `<lane> == 'true' || ci == 'true'`.  That lets a
+  workflow refactor light up every dependent job.
+
+outputs:
+  build:
+    description: Run C/C++/Go build + smoke.
+    value: ${{ steps.decide.outputs.build }}
+  tests:
+    description: Run `make -jN test` (gtest suite).
+    value: ${{ steps.decide.outputs.tests }}
+  container:
+    description: Run container/test.sh + hello docker build.
+    value: ${{ steps.decide.outputs.container }}
+  python:
+    description: Run ruff / mypy on Python.
+    value: ${{ steps.decide.outputs.python }}
+  shell:
+    description: Run shellcheck on .sh files.
+    value: ${{ steps.decide.outputs.shell }}
+  docs:
+    description: docs/** or *.md touched.
+    value: ${{ steps.decide.outputs.docs }}
+  ci:
+    description: CI itself was touched -- callers should cascade this
+                 to every lane they gate.
+    value: ${{ steps.decide.outputs.ci }}
+
+runs:
+  using: composite
+  steps:
+    # For pull_request events, dorny/paths-filter compares the PR's
+    # base against its head and emits one boolean per named filter.
+    # For push/schedule/dispatch we skip it and fall through to the
+    # fail-open branch below.
+    - name: Filter paths (PR only)
+      id: filter
+      if: github.event_name == 'pull_request'
+      uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36  # v3.0.2
+      with:
+        # Anchor '**' patterns to repo root; `list-files: none` so
+        # we only need the boolean, not the actual file list.
+        list-files: none
+        filters: |
+          # Anything under .github/** flips this lane; the orchestrator
+          # cascades `ci=true` to every dependent job so a workflow
+          # refactor exercises what it touches.
+          ci:
+            - '.github/**'
+          # Any .mk / Makefile / framework file / example source
+          # invalidates the build lane.
+          build:
+            - 'Makefile'
+            - '**/*.mk'
+            - 'production/make/**'
+            - 'production/tools/**'
+            - 'example/**'
+            - 'do_build.sh'
+          # Test targets live at example/*/test/**; gtest itself is
+          # vendored under production/tools/gtest-*.
+          tests:
+            - 'example/**/test/**'
+            - 'production/tools/gtest-*/**'
+            - 'production/test/**'
+          # Container: everything under container/, plus the shared
+          # dep-hooks.sh (which container sources from gm's tree).
+          container:
+            - 'container/**'
+            - 'production/tools/dep-hooks.sh'
+          python:
+            - '**/*.py'
+          shell:
+            - '**/*.sh'
+          docs:
+            - 'README*'
+            - 'CHANGELOG*'
+            - 'docs/**'
+            - '**/*.md'
+
+    # Non-PR events (push / dispatch / schedule) fail open — set
+    # every lane to 'true' so post-merge validation stays
+    # comprehensive.  Same behaviour applies if the PR was opened
+    # without a base (edge case).
+    - name: Decide (with fail-open on non-PR)
+      id: decide
+      shell: bash
+      env:
+        IS_PR: ${{ github.event_name == 'pull_request' }}
+        # These are 'true'/'false' strings from paths-filter, or
+        # empty when the filter step was skipped.
+        F_CI:        ${{ steps.filter.outputs.ci }}
+        F_BUILD:     ${{ steps.filter.outputs.build }}
+        F_TESTS:     ${{ steps.filter.outputs.tests }}
+        F_CONTAINER: ${{ steps.filter.outputs.container }}
+        F_PYTHON:    ${{ steps.filter.outputs.python }}
+        F_SHELL:     ${{ steps.filter.outputs.shell }}
+        F_DOCS:      ${{ steps.filter.outputs.docs }}
+      run: |
+        set -euo pipefail
+        emit() { echo "$1=$2" >> "$GITHUB_OUTPUT" ; echo "  $1 = $2"; }
+        echo "Lane decisions (event=${{ github.event_name }}):"
+        if [ "$IS_PR" != "true" ]; then
+          # Fail open.
+          for lane in ci build tests container python shell docs ; do
+            emit "$lane" "true"
+          done
+        else
+          emit ci        "${F_CI:-false}"
+          emit build     "${F_BUILD:-false}"
+          emit tests     "${F_TESTS:-false}"
+          emit container "${F_CONTAINER:-false}"
+          emit python    "${F_PYTHON:-false}"
+          emit shell     "${F_SHELL:-false}"
+          emit docs      "${F_DOCS:-false}"
+        fi

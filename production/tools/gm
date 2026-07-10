@@ -1,0 +1,174 @@
+#!/bin/bash
+# production/tools/gm -- one entry point for everything gm does.
+#
+# Without this wrapper a user has to remember three unrelated command
+# shapes:
+#
+#     make libt1                                        # build
+#     python3 production/make/scripts/dep_query.py ...  # dep queries
+#     container/imageBuild.py build image.yaml          # images
+#
+# ...plus find PROJ_TOP by hand when they're deep in a source tree.
+# `gm` unifies them and locates the repo root itself, so every
+# command works from any directory.
+#
+# Install:
+#     ln -s "$PWD/production/tools/gm" ~/.local/bin/gm
+#
+# Design: this is a THIN dispatcher.  It never reimplements build
+# logic -- every subcommand shells out to make / dep_query.py /
+# imageBuild.py, and unknown subcommands fall through to make.  That
+# keeps `make <anything>` working as the escape hatch and stops this
+# script from becoming a second source of truth.
+
+set -uo pipefail
+
+# ------------------------------------------------------------------
+# Locate the gm tree.
+#
+# Walk up from CWD looking for the marker pair (a Makefile plus a
+# production/make/env.mk).  Both are required: a bare Makefile could
+# belong to any project, and production/ alone could be a vendored
+# copy inside a tree whose root is further up.
+# ------------------------------------------------------------------
+find_proj_top() {
+    local d="${GM_PROJ_TOP:-$PWD}"
+    while [ "$d" != "/" ]; do
+        if [ -f "$d/Makefile" ] && [ -f "$d/production/make/env.mk" ]; then
+            printf '%s' "$d"
+            return 0
+        fi
+        d=$(dirname "$d")
+    done
+    return 1
+}
+
+PROJ_TOP=$(find_proj_top) || {
+    echo "gm: not inside a gm tree (no Makefile + production/make/env.mk above $PWD)" >&2
+    echo "    set GM_PROJ_TOP=/path/to/tree to override" >&2
+    exit 2
+}
+
+DEP_QUERY="$PROJ_TOP/production/make/scripts/dep_query.py"
+IMAGE_BUILD="$PROJ_TOP/container/imageBuild.py"
+PRECHECK="$PROJ_TOP/production/tools/precheck.sh"
+
+# ANSI only on a tty.
+if [ -t 1 ]; then C_B=$'\e[1m'; C_D=$'\e[2m'; C_R=$'\e[0m'
+else C_B=; C_D=; C_R=; fi
+
+# `--no-print-directory` here, not just in env.mk: the outer make
+# emits its "Entering/Leaving directory" banner for `-C` before it
+# ever parses env.mk, so MAKEFLAGS from there is too late.
+run_make() { make --no-print-directory -C "$PROJ_TOP" "$@" ; }
+
+usage() {
+cat <<EOF
+${C_B}gm${C_R} -- unified entry point for the gm build system
+     tree: ${C_D}$PROJ_TOP${C_R}
+
+${C_B}BUILD${C_R}
+  gm build [<target>...]      build targets (default: all)
+  gm clean [<target>...]      clean targets (default: all)
+  gm distclean                wipe the output tree
+  gm rebuild <target>...      clean + build those targets
+  gm list                     list every discovered target
+  gm test [<name>...]         build + run tests (default: all)
+
+${C_B}DEPENDENCIES${C_R}
+  gm deps                     regenerate depend.mk / pkg_of.mk
+  gm graph                    dump the file-level DAG
+  gm changes <path>...        which targets do these files affect?
+  gm since <git-ref>          same, from git diff <ref>..HEAD
+  gm refresh [<git-ref>]      rebuild affected + refresh the dep graph
+
+${C_B}IMAGES${C_R}
+  gm image build <manifest>   build a container image
+  gm image <subcmd> [args]    any imageBuild.py subcommand
+
+${C_B}QUALITY${C_R}
+  gm check                    run every local static check (precheck)
+  gm coverage [lcov]          coverage report (gcovr, or lcov)
+
+${C_B}ESCAPE HATCH${C_R}
+  gm <anything else>          forwarded verbatim to \`make -C $PROJ_TOP\`
+                              e.g. \`gm libt1 BUILD_MODE=release\`
+
+${C_B}COMMON FLAGS${C_R} (pass through to make)
+  -jN                         parallel
+  BUILD_MODE=debug|release|coverage
+  GM_OUT=<dir>                relocate the output tree
+  DEP_TREE=yes                emit .dep.json sidecars while building
+EOF
+}
+
+need_arg() {
+    [ -n "${2:-}" ] || { echo "gm $1: needs an argument (gm help)" >&2; exit 2; }
+}
+
+cmd="${1:-help}"
+[ $# -gt 0 ] && shift
+
+case "$cmd" in
+    help|-h|--help)   usage ;;
+
+    # ---- build ----------------------------------------------------
+    build)            run_make "${@:-all}" ;;
+    clean)
+        if [ $# -eq 0 ]; then run_make clean
+        else
+            # Per-target clean goes through SUB_TARGET, not the `clean`
+            # phony (which cleans everything).
+            for t in "$@"; do run_make "$t" SUB_TARGET=clean || exit $?; done
+        fi ;;
+    distclean)        run_make distclean ;;
+    rebuild)
+        need_arg rebuild "${1:-}"
+        for t in "$@"; do run_make "$t" SUB_TARGET=clean || exit $?; done
+        run_make "$@" ;;
+    list)             run_make -s list-targets ;;
+    test)
+        if [ $# -eq 0 ]; then run_make test
+        else run_make test TESTS="$*" ; fi ;;
+
+    # ---- dependencies ---------------------------------------------
+    deps)             run_make deps "$@" ;;
+    graph)            run_make deps-files ;;
+    changes)
+        need_arg changes "${1:-}"
+        run_make changes CHANGES="$*" ;;
+    since)
+        need_arg since "${1:-}"
+        run_make changes-since SINCE="$1" ;;
+    refresh)
+        if [ $# -eq 0 ]; then run_make refresh
+        else run_make refresh SINCE="$1" ; fi ;;
+
+    # ---- images ---------------------------------------------------
+    image|img)
+        [ -x "$IMAGE_BUILD" ] || {
+            echo "gm image: $IMAGE_BUILD not found or not executable" >&2
+            exit 2 ; }
+        need_arg image "${1:-}"
+        # imageBuild.py resolves manifest paths relative to CWD, so
+        # run it from where the user actually is.
+        exec python3 "$IMAGE_BUILD" "$@" ;;
+
+    # ---- quality --------------------------------------------------
+    check|precheck)   exec bash "$PRECHECK" "$@" ;;
+    coverage)
+        case "${1:-gcovr}" in
+            lcov)  run_make coverage-lcov ;;
+            gcovr) run_make coverage ;;
+            *)     echo "gm coverage: expected 'gcovr' or 'lcov'" >&2; exit 2 ;;
+        esac ;;
+
+    # ---- raw dep_query (power users) ------------------------------
+    dep-query|dq)     exec python3 "$DEP_QUERY" "$@" ;;
+
+    # ---- escape hatch ---------------------------------------------
+    # Anything unrecognised is a make goal.  Keeps `gm libt1`,
+    # `gm pkg-p2 BUILD_MODE=release`, `gm -j8 all` working without
+    # this script needing to know every target name.
+    *)                run_make "$cmd" "$@" ;;
+esac

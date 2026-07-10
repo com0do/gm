@@ -1,0 +1,258 @@
+name: Set up gm build environment
+description: >-
+  Install everything gm's Makefile expects on a Rocky 8 (or ubuntu)
+  runner: gcc / g++ / ar / make, jq, python3 + PyYAML, ccache, gcovr,
+  lcov, rpmbuild, go (for `example/g1`), and shellcheck.  Also
+  provisions ccache with a stable key derived from OS + BUILD_MODE
+  so incremental C/C++ builds stay hot across PR iterations.
+
+  Runs on both:
+    * `container: rockylinux:8` (the accurate build target;
+      BUILD_ARCH=rhlinux)
+    * `ubuntu-latest`           (fallback for lint / docs / docker jobs)
+
+  Inputs are all optional -- callers just `uses:` the action and
+  the right tools land.
+
+inputs:
+  build-mode:
+    description: BUILD_MODE (debug / release / coverage) -- used to
+                 shape ccache key.  Default 'debug'.
+    required: false
+    default: 'debug'
+  install-docker:
+    description: Also install docker client + buildx (ubuntu-latest
+                 only).  Set to 'true' for container-build jobs.
+    required: false
+    default: 'false'
+  install-coverage:
+    description: Install gcovr + lcov + perl bits for `make coverage`.
+                 Default 'false' (only coverage job needs them).
+    required: false
+    default: 'false'
+  install-go:
+    description: Install golang toolchain for `example/g1`.  Default
+                 'true' since it's cheap.
+    required: false
+    default: 'true'
+  install-java:
+    description: Install a JDK (javac + jar + java) for target.java.mk
+                 (example/j1, example/j2).  Default 'true' -- the
+                 install is cheap, and the C-only lane still needs
+                 java for the smoke run of j2.jar in the build job.
+    required: false
+    default: 'true'
+
+runs:
+  using: composite
+  steps:
+    # ────────────────────────────────────────────────────────────
+    # Detect OS -- Rocky vs Ubuntu -- so we pick the right pm.
+    # ────────────────────────────────────────────────────────────
+    - name: Detect OS
+      id: os
+      shell: bash
+      run: |
+        if [ -f /etc/rocky-release ] || [ -f /etc/redhat-release ]; then
+          echo "family=rhel" >> "$GITHUB_OUTPUT"
+        else
+          echo "family=ubuntu" >> "$GITHUB_OUTPUT"
+        fi
+
+    # ────────────────────────────────────────────────────────────
+    # RHEL / Rocky path (matches production target: BUILD_ARCH=rhlinux)
+    #
+    # We cache /var/cache/dnf across runs -- dnf lays out downloaded
+    # RPMs and repodata there, and re-hitting the mirror is the slow
+    # part of a fresh dnf install.  Cache key is scoped to os-family
+    # + a hash of THIS action's inputs so a change to the package
+    # set invalidates cleanly.
+    # ────────────────────────────────────────────────────────────
+    - name: Restore dnf cache (RHEL family)
+      if: steps.os.outputs.family == 'rhel'
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+      with:
+        path: |
+          /var/cache/dnf
+          /var/lib/dnf
+        # Bump the suffix (v1) if the package list below changes so
+        # old caches don't shadow the update.  Salting with `runner.os`
+        # keeps ubuntu vs rocky caches distinct.
+        key: dnf-${{ runner.os }}-v1-${{ inputs.build-mode }}-${{ inputs.install-coverage }}-${{ inputs.install-go }}-${{ inputs.install-java }}
+        restore-keys: |
+          dnf-${{ runner.os }}-v1-
+
+    - name: Install base toolchain (RHEL family)
+      if: steps.os.outputs.family == 'rhel'
+      shell: bash
+      run: |
+        set -euo pipefail
+        # `--setopt=keepcache=1` makes dnf preserve downloaded RPMs
+        # for the actions/cache above; otherwise dnf auto-cleans.
+        dnf install -y --setopt=install_weak_deps=False \
+            --setopt=keepcache=1 \
+            gcc gcc-c++ make ar binutils \
+            python3 python3-pip python3-pyyaml \
+            jq git which \
+            rpm-build rpmdevtools \
+            findutils tar gzip \
+            ccache shellcheck
+        ln -sf /usr/bin/python3 /usr/local/bin/python || true
+
+    - name: Install coverage tools (RHEL family)
+      if: steps.os.outputs.family == 'rhel' && inputs.install-coverage == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        dnf install -y --enablerepo=powertools --setopt=install_weak_deps=False \
+            lcov perl-DateTime perl-JSON perl-App-cpanminus || true
+        python3 -m pip install --user --no-warn-script-location gcovr
+
+    - name: Install Go (RHEL family)
+      if: steps.os.outputs.family == 'rhel' && inputs.install-go == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        dnf install -y --setopt=install_weak_deps=False golang || true
+
+    - name: Install JDK (RHEL family)
+      if: steps.os.outputs.family == 'rhel' && inputs.install-java == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        # java-11-openjdk-devel is available on Rocky 8/9 without
+        # extra repos; ships javac + jar + java together.  target.java.mk
+        # calls javac/jar directly (no JAVA_HOME dance), so PATH is
+        # all we need.
+        dnf install -y --setopt=install_weak_deps=False \
+            java-11-openjdk-devel || true
+
+    # ────────────────────────────────────────────────────────────
+    # Ubuntu path (fallback for lint / docker / docs jobs)
+    #
+    # apt caching via actions/cache -- /var/cache/apt/archives holds
+    # every downloaded .deb.  Same key discipline as the dnf branch.
+    # Without this the container-build job burns ~25s on `apt-get
+    # install docker...` every single run.
+    # ────────────────────────────────────────────────────────────
+    - name: Restore apt cache (Ubuntu)
+      if: steps.os.outputs.family == 'ubuntu'
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+      with:
+        path: /var/cache/apt/archives
+        key: apt-${{ runner.os }}-v1-${{ inputs.install-coverage }}-${{ inputs.install-go }}-${{ inputs.install-java }}-${{ inputs.install-docker }}
+        restore-keys: |
+          apt-${{ runner.os }}-v1-
+
+    - name: Install base toolchain (Ubuntu)
+      if: steps.os.outputs.family == 'ubuntu'
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Prevent apt-get from wiping the cache we just restored --
+        # DPkg::Post-Invoke's `apt-get clean` fires by default on
+        # GH runners because /etc/apt/apt.conf.d/docker-clean is
+        # present.  Neuter it for the duration of the job.
+        sudo rm -f /etc/apt/apt.conf.d/docker-clean
+        echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' \
+            | sudo tee /etc/apt/apt.conf.d/keep-cache >/dev/null
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends \
+            build-essential ccache jq \
+            python3 python3-pip python3-yaml \
+            rpm shellcheck git ca-certificates
+
+    - name: Install coverage tools (Ubuntu)
+      if: steps.os.outputs.family == 'ubuntu' && inputs.install-coverage == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get install -y --no-install-recommends lcov
+        python3 -m pip install --user --no-warn-script-location gcovr
+
+    - name: Install Go (Ubuntu)
+      if: steps.os.outputs.family == 'ubuntu' && inputs.install-go == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get install -y --no-install-recommends golang-go
+
+    - name: Install JDK (Ubuntu)
+      if: steps.os.outputs.family == 'ubuntu' && inputs.install-java == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get install -y --no-install-recommends default-jdk-headless
+
+    # ────────────────────────────────────────────────────────────
+    # ccache: point PATH prefix at /usr/lib*/ccache so gcc/g++
+    # invocations from env.mk (`/usr/bin/gcc`) transparently
+    # cache -- and set CCACHE_DIR to a stable location we cache
+    # via actions/cache.
+    # ────────────────────────────────────────────────────────────
+    - name: Prime ccache PATH + dir
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Rocky ships ccache wrappers at /usr/lib64/ccache/, ubuntu at
+        # /usr/lib/ccache/.  Prepend whichever exists.
+        for d in /usr/lib64/ccache /usr/lib/ccache ; do
+          [ -d "$d" ] && echo "$d" >> "$GITHUB_PATH"
+        done
+        mkdir -p "$HOME/.ccache"
+        echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
+        # Bound cache to keep the tarball reasonable across the
+        # matrix (debug + release).  10 GB is well above what
+        # gm's example/ needs but leaves room for user forks.
+        ccache -M 2G || true
+
+    - name: Restore ccache
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+      with:
+        path: ~/.ccache
+        # Keying by BUILD_MODE keeps debug + release from evicting
+        # each other; OS keeps rocky/ubuntu separated.
+        key: ccache-${{ runner.os }}-${{ inputs.build-mode }}-${{ github.sha }}
+        restore-keys: |
+          ccache-${{ runner.os }}-${{ inputs.build-mode }}-
+          ccache-${{ runner.os }}-
+
+    # ────────────────────────────────────────────────────────────
+    # Docker (only when caller opts in -- ubuntu-latest only).
+    # ────────────────────────────────────────────────────────────
+    - name: Set up Docker Buildx
+      if: inputs.install-docker == 'true' && steps.os.outputs.family == 'ubuntu'
+      uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435  # v3.11.1
+
+    # ────────────────────────────────────────────────────────────
+    # Sanity: print versions so a broken CI is easy to diagnose.
+    # ────────────────────────────────────────────────────────────
+    - name: Show tool versions
+      shell: bash
+      run: |
+        set +e
+        echo "=== toolchain ==="
+        which gcc && gcc --version | head -1
+        which g++ && g++ --version | head -1
+        which ar  && ar  --version | head -1
+        which ld  && ld  --version | head -1
+        which make && make --version | head -1
+        which python3 && python3 --version
+        which jq  && jq  --version
+        which ccache && ccache --version | head -1
+        which rpmbuild && rpmbuild --version
+        which shellcheck && shellcheck --version | head -3
+        if [ "${{ inputs.install-go }}" = "true" ]; then
+          which go && go version
+        fi
+        if [ "${{ inputs.install-java }}" = "true" ]; then
+          which javac && javac -version 2>&1 | head -1
+          which jar   && jar --version 2>&1 | head -1
+          which java  && java -version 2>&1 | head -1
+        fi
+        if [ "${{ inputs.install-coverage }}" = "true" ]; then
+          which gcovr && gcovr --version | head -1
+          which lcov  && lcov  --version | head -1
+        fi
+        echo "=== python3 modules ==="
+        python3 -c 'import yaml; print("PyYAML", yaml.__version__)'

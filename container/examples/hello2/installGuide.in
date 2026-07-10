@@ -1,0 +1,2 @@
+[RPMINSTALL]
+# nothing; extras/pkg-p2.rpm is staged but demo skips installing

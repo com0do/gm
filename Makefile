@@ -1,82 +1,79 @@
-# Makefile - cyrus make tools
+# SPDX-License-Identifier: MIT
 #
-# Copyright (c) 2024 cyrus cui <cyrus.cui@nokia-sbell.com>
-#
-# Permission is hereby granted, free of charge, to any person obtaining
-# a copy of this software and associated documentation files (the
-# "Software"), to deal in the Software without restriction, including
-# without limitation the rights to use, copy, modify, merge, publish,
-# distribute, sublicense, and/or sell copies of the Software, and to
-# permit persons to whom the Software is furnished to do so, subject to
-# the following conditions:
-#
-# The above copyright notice and this permission notice shall be
-# included in all copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
-# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
-# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
-# LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
-# WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+# Framework entry point.  User-facing cmd reference: docs/1-USER_GUIDE.md §4.
 
-
-
-include $(CURDIR)/make/rules.mk
-
-# config
-DEP_DERIVATION_PARALLEL := 0
-
-
-# target check
-ifeq ($(o),clean)
-SUB_TARGET := clean
-else ifeq ($(o),check)
-SUB_TARGET := check
+.DEFAULT_GOAL := all
+ifneq ($(strip $(GM_TREE)),)
+$(error gm cannot be nested. GM_TREE is gm internal variable, \
+do not set it on the command line.)
 endif
 
-TARGET_DEP := $(CURDIR)/make/depend.mk
-ifneq ($(MAKECMDGOALS),dep)
--include $(TARGET_DEP)
-endif
+# Include order matters.
+include $(CURDIR)/production/make/env.mk
+include $(CURDIR)/production/make/project.mk
+include $(CURDIR)/production/make/incremental.mk
+include $(CURDIR)/production/make/coverage.mk
+include $(CURDIR)/production/make/test.mk
 
-ifneq ($(filter lib%,$(MAKECMDGOALS)),)
-ifneq ($(filter pkg%,$(MAKECMDGOALS)),)
-$(error ERROR: Do not mix lib and pkg target)
+ifneq ($(DRY_RUN),1)
+include $(TARGET_DEP)
+ifneq ($(_DEP_DIGEST),$(_DEP_DIGEST_NOW))
+$(shell $(RM) $(TARGET_DEP) $(GM_PKG_OF_FILE))
 endif
 endif
 
+.PHONY: all clean distclean precheck prereq
+all:   $(TARGET_ALL) compile_commands
+clean: SUB_TARGET := clean
+clean: $(TARGET_ALL)
 
-all:  $(TARGET_ALL)
-dep:  DRY_RUN := 1
-clean:SUB_TARGET := clean
-clean:$(TARGET_ALL)
-.PRECIOUS: $(TARGET_DEP)
-.PHONY: all dep clean
+distclean:
+	@$(RM) -r $(GM_OUT)
+	@$(ECHO) "... distclean: removed $(GM_OUT)"
 
-# automatic dependence derivation
-ifeq ($(MAKELEVEL), 0)
-$(TARGET_DEP): $(TARGET_ALL_MK)
-ifeq ($(DEP_DERIVATION_PARALLEL),1)
-	@$(MAKE) $(foreach sub,$?,$(basename $(notdir $(sub)))) DRY_RUN=1
-else
-	@for sub in $? ;do $(MAKE) $$(basename $$sub .mk) DRY_RUN=1 ;done
-endif
-	@sort -o $(TARGET_DEP) $(TARGET_DEP)
-endif
+precheck:
+	@bash $(ADMIN_DIR)/tools/precheck.sh $(if $(FIX),--fix) $(if $(FAST),--fast)
+
+prereq:
+	@py=$$(command -v python3 || command -v python) ; \
+	[ -n "$$py" ] || { echo "gm: no python3 in PATH" >&2 ; exit 1 ; } ; \
+	in_venv=$$("$$py" -c 'import sys; print(1 if sys.prefix!=sys.base_prefix else 0)') ; \
+	option= ; [ ! "$$in_venv" = 1 ] && option=--user ; \
+	$(if $(V),set -x,echo "+ $$py -m pip install --disable-pip-version-check $$option -r $(GM_PYDEP_REQS)") ; \
+	"$$py" -m pip install --disable-pip-version-check $$option -r $(GM_PYDEP_REQS)
 
 
+TARGET_RULES_FOR = $(strip \
+    $(if $(filter exe lib test,$(1)),      $(ADMIN_DIR)/make/target.c.mk,\
+    $(if $(filter go,$(1)),                $(ADMIN_DIR)/make/target.go.mk,\
+    $(if $(filter java,$(1)),              $(ADMIN_DIR)/make/target.java.mk,\
+    $(if $(filter pkg,$(1)),               $(ADMIN_DIR)/make/target.pkg.mk,\
+    $(if $(filter import-lib import-exe,$(1)),$(ADMIN_DIR)/make/target.import.mk,\
+    $(error No recipe file for target type "$(1)")))))))
 
-# general recipe
-dep: $(TARGET_ALL)
-	@sort -o $(TARGET_DEP) $(TARGET_DEP)
+_GM_CMDLINE_ROOT := PROJ_TOP='$(PROJ_TOP)' ADMIN_DIR='$(ADMIN_DIR)' \
+                    BUILD_ARCH='$(BUILD_ARCH)' BUILD_MODE='$(BUILD_MODE)' \
+                    GM_OUT='$(GM_OUT)' DEP_TREE='$(DEP_TREE)'
+_GM_CMDLINE_PROJ  = GM_SYS_LIBS='$(GM_SYS_LIBS)' \
+                    TARGET_ALL='$(TARGET_ALL)' TARGET_DEP='$(TARGET_DEP)'
+_GM_CMDLINE = $(_GM_CMDLINE_ROOT) $(_GM_CMDLINE_PROJ)
+
 $(TARGET_ALL):
-	@[ "$(SOURCE_DIR)" != "not found" ] && $(MAKE) -C $(SOURCE_DIR) -f $@.mk $(SUB_TARGET) \
-	|| (echo "Is $(SOURCE_DIR)/$@.mk OK ?";exit 1)
+	@$(MAKE) -C $(SOURCE_DIR) -f $(ADMIN_DIR)/make/env.mk \
+	    -f $($@_mkfile) -f $(call TARGET_RULES_FOR,$(TYPE)) $(_GM_CMDLINE) \
+	    BUILD_DIR='$(BUILD_DIR)' OUT_DIR='$(OUT_DIR)' SOURCE_DIR='$(SOURCE_DIR)' \
+	    REL_DIR='$(REL_DIR)' TYPE='$(TYPE)' $(SUB_TARGET)
 
 
-
-
+_PKG_HEADER_TARGETS := $(patsubst %,%-header,$(TARGET_PKG))
+.PHONY: $(_PKG_HEADER_TARGETS)
+$(_PKG_HEADER_TARGETS): %-header:
+	@$(MAKE) -C $(SOURCE_DIR) \
+	    -f $(ADMIN_DIR)/make/env.mk \
+	    -f $($*_mkfile) \
+	    -f $(ADMIN_DIR)/make/target.pkg.mk \
+	    $(_GM_CMDLINE) \
+	    BUILD_DIR='$(BUILD_DIR)' OUT_DIR='$(OUT_DIR)' SOURCE_DIR='$(SOURCE_DIR)' \
+	    REL_DIR='$(REL_DIR)' TYPE='$(TYPE)' header
 
 

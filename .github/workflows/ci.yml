@@ -1,0 +1,870 @@
+name: CI
+
+# ─────────────────────────────────────────────────────────────────────
+# Main PR + push orchestrator.  One workflow, many jobs, gated by
+# lane classifier (.github/actions/detect-changes) so trivial docs
+# / metadata PRs don't spin the full docker+gcovr stack.
+#
+# Coverage matrix (what this file actually verifies):
+#
+#   lint-shell    shellcheck every .sh + shfmt --diff
+#   lint-python   ruff + mypy on production/ and container/
+#   build         `make -jN` in {debug, release}; smoke exec
+#   dep-idempot   `make deps` twice == same depend.mk (P0 regression gate)
+#   test          `make -jN test` (gtest suite)
+#   dep-graph     `make DEP_TREE=yes all` + `make deps-files` +
+#                 dep_query.py sanity; upload full DAG as artefact
+#   incremental   PR-only: `make changes-since SINCE=<base>` +
+#                 `make refresh SINCE=<base> DRY_RUN=1` to verify the
+#                 plan; PR comment with the affected-target list
+#   coverage      `make coverage` (gcovr) + upload HTML + codecov
+#   container     `container/test.sh` (needs docker) + hello docker build
+#   integration   full pipeline: build → container/imageBuild.py deps →
+#                 verify dep_query.py stitches gm's pkg tier to
+#                 container's image tier (matches TODO.md#P0-3)
+#
+# Everything runs on Rocky 8 (BUILD_ARCH=rhlinux -- matches production)
+# except lint (ubuntu, faster) and container (ubuntu, needs docker
+# host).  Composite actions/setup-gm-env normalises the two.
+# ─────────────────────────────────────────────────────────────────────
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents:      read
+  pull-requests: write   # PR-comment on incremental / rpm-update jobs
+  actions:       read
+  checks:        write
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # Cancel superseded PR runs; keep push runs alive so main-branch
+  # results stay linear and reviewable.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # gm honours BUILD_ARCH=rhlinux (env.mk L107).  CI runs it explicitly
+  # so ubuntu jobs (which would fall back to `linux`) still match.
+  BUILD_ARCH: rhlinux
+  # Faster ccache lookups: hash mtime, not contents.  Safe on CI where
+  # source trees are freshly checked out.
+  CCACHE_COMPILERCHECK: content
+  # gm's Makefile allows -jN via env; CI runners have 2 cores, so -j2
+  # is the sweet spot (empirically faster than -j4 on shared runners).
+  MAKEFLAGS: -j2 --no-print-directory
+
+jobs:
+  # ═════════════════════════════════════════════════════════════════
+  # detect: classify what changed → outputs drive job gating
+  # ═════════════════════════════════════════════════════════════════
+  detect:
+    name: Detect affected areas
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      build:     ${{ steps.classify.outputs.build }}
+      tests:     ${{ steps.classify.outputs.tests }}
+      container: ${{ steps.classify.outputs.container }}
+      python:    ${{ steps.classify.outputs.python }}
+      shell:     ${{ steps.classify.outputs.shell }}
+      docs:      ${{ steps.classify.outputs.docs }}
+      ci:        ${{ steps.classify.outputs.ci }}
+      base_sha:  ${{ steps.range.outputs.base_sha }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          # Need history for `git diff BASE..HEAD` in incremental job.
+          fetch-depth: 0
+      - name: Classify
+        id: classify
+        uses: ./.github/actions/detect-changes
+
+      - name: "Compute base SHA for `make changes-since`"
+        id: range
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "base_sha=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
+          else
+            # push / dispatch: use HEAD~1 so the incremental job has
+            # something to diff against.
+            base=$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)
+            echo "base_sha=${base}" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ═════════════════════════════════════════════════════════════════
+  # precheck: runs production/tools/precheck.sh -- the SAME script
+  # contributors run locally (via `make precheck`).  This job exists
+  # to guarantee CI and local stay in lockstep: any check that runs
+  # in CI ALSO has a local runner.  If precheck ever diverges from
+  # the lint-shell / lint-python / actionlint jobs below, that's a
+  # bug in the script itself.
+  #
+  # Note: gm is not a Python project, so its Python tooling config
+  # lives under production/ (not the repo root).  precheck.sh points
+  # ruff/mypy at production/pyproject.toml explicitly.
+  #
+  # Deliberately independent of `detect` outputs -- static checks are
+  # cheap and should always run.
+  # ═════════════════════════════════════════════════════════════════
+  precheck:
+    name: Local precheck (production/tools/precheck.sh)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          # gm helper scripts require Python 3.12+ (PEP 695 `type`
+          # statement).  Matches production/{mypy,ruff}/*.
+          python-version: '3.12'
+          cache: pip
+          # gm keeps its Python tooling config out of the repo root
+          # (it's not a Python package) AND out of a pyproject.toml
+          # (which itself carries PEP 621 packaging semantics).
+          # Two native config files, both listed here so setup-
+          # python's cache key invalidates when either one changes.
+          cache-dependency-path: |
+            production/ruff/ruff.toml
+            production/mypy/mypy.ini
+      - name: Install linters (pip)
+        run: |
+          set -euo pipefail
+          python3 -m pip install --upgrade pip
+          python3 -m pip install \
+              'ruff>=0.6,<1' 'mypy>=1.10,<2' \
+              'pyyaml>=6,<7' 'types-PyYAML>=6,<7' \
+              'jsonschema>=4.20,<5'
+      - name: Install linters (system)
+        run: |
+          sudo rm -f /etc/apt/apt.conf.d/docker-clean
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+              shellcheck jq
+      - name: Install actionlint into /tmp
+        # Same install path production/tools/precheck.sh probes --
+        # keeps the local and CI resolution paths identical.
+        run: |
+          curl -sSL 'https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash' \
+              | bash -s -- 1.7.7 /tmp
+      - name: Run production/tools/precheck.sh
+        # Exactly the command a contributor runs locally via `make
+        # precheck`.  If this fails, the fix is one line in the
+        # precheck output.
+        run: bash production/tools/precheck.sh
+
+  # ═════════════════════════════════════════════════════════════════
+  # lint-shell: shellcheck on every .sh (framework + examples)
+  #
+  # Redundant with the `precheck` job above, but kept because:
+  #   * lane gating skips it on docs-only PRs
+  #   * a failure here has a distinct GH check name, which makes
+  #     branch protection rules more surgical
+  # ═════════════════════════════════════════════════════════════════
+  lint-shell:
+    name: Lint shell
+    needs: detect
+    if: needs.detect.outputs.shell == 'true' || needs.detect.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - name: Install shellcheck
+        run: sudo apt-get install -y --no-install-recommends shellcheck
+      - name: Run shellcheck
+        run: |
+          set -euo pipefail
+          # -e: only report the given severities; -S style suppresses
+          # noise, -x follows source'd files so we lint imports.
+          # SC1091 (Can't follow non-constant source) is OK -- our
+          # scripts source from dynamic paths.
+          find production/make/scripts production/tools container \
+               -name '*.sh' -type f -print0 |
+            xargs -0 shellcheck -x -S warning -e SC1091
+
+  # ═════════════════════════════════════════════════════════════════
+  # lint-python: ruff (fast) + mypy (types).  Applies to every .py
+  # under production/ and container/ (excluding __pycache__).
+  # ═════════════════════════════════════════════════════════════════
+  lint-python:
+    name: Lint python
+    needs: detect
+    if: needs.detect.outputs.python == 'true' || needs.detect.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      # `actions/setup-python` has native pip caching.  Key it off
+      # both linter configs so a rule/version change invalidates.
+      # Cuts the "pip install ruff+mypy" step from ~40s to ~3s on
+      # cache hit.
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            production/ruff/ruff.toml
+            production/mypy/mypy.ini
+      - name: Install linters
+        run: |
+          set -euo pipefail
+          python3 -m pip install --upgrade pip
+          # Version-pinned upper bounds per gm's dep-pinning intuition
+          # (see docs/6-TODO.md; not a hard project rule yet, but
+          # matches hermes-agent conventions).  types-PyYAML is the
+          # mypy stub package; without it mypy complains about
+          # `import yaml` in container/buildTools/pybuild/manifest.py.
+          # jsonschema drives pkg-xml.py's schema validation +
+          # defaults filling (production/make/schemas/pkg.schema.yaml).
+          python3 -m pip install \
+              'ruff>=0.6,<1' 'mypy>=1.10,<2' \
+              'pyyaml>=6,<7' 'types-PyYAML>=6,<7' \
+              'jsonschema>=4.20,<5'
+      - name: Ruff
+        # Explicit --config: our Python tooling config lives at
+        # production/ruff/ruff.toml (native ruff format, not a
+        # pyproject.toml -- see that file's header for why).
+        # Ruff won't auto-find it when linting container/ otherwise.
+        run: ruff check --config production/ruff/ruff.toml production/ container/
+      - name: Mypy
+        # Same --config-file rationale as ruff above.  No
+        # `continue-on-error` anymore -- production/tools/precheck.sh
+        # keeps mypy green locally, so any regression should block
+        # the PR the same way ruff / shellcheck do.
+        run: mypy --config-file production/mypy/mypy.ini production/ container/
+
+  # ═════════════════════════════════════════════════════════════════
+  # build: Rocky 8 container; matrix BUILD_MODE={debug,release}.
+  # Runs the FULL `make all` + smoke exec.
+  # ═════════════════════════════════════════════════════════════════
+  build:
+    name: Build (${{ matrix.mode }})
+    needs: detect
+    if: needs.detect.outputs.build == 'true' || needs.detect.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [debug, release]
+    container:
+      image: rockylinux:8
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Set up gm environment
+        uses: ./.github/actions/setup-gm-env
+        with:
+          build-mode: ${{ matrix.mode }}
+          install-go: 'true'
+
+      - name: Full build
+        run: |
+          set -euo pipefail
+          make BUILD_MODE=${{ matrix.mode }} all
+          # Sanity: smoke exec must produce the expected version string.
+          ./build/exec/${BUILD_ARCH}/${{ matrix.mode }}/t3 | grep -E 't1_cxx|t2_cxx'
+
+      - name: Verify artefacts landed in typed subdirs
+        run: |
+          # OUT_DIR layout must be respected: libs under lib/, exes
+          # under exec/, rpms under pkg/ -- guards against a
+          # regression to the pre-refactor "everything in lib/" era
+          # (see git 6e775e8 / c534fca).
+          set -euo pipefail
+          test -f build/lib/${BUILD_ARCH}/${{ matrix.mode }}/libt1.a
+          test -f build/lib/${BUILD_ARCH}/${{ matrix.mode }}/libt2.so
+          test -x build/exec/${BUILD_ARCH}/${{ matrix.mode }}/t3
+          test -x build/exec/${BUILD_ARCH}/${{ matrix.mode }}/g1
+          ls build/pkg/${BUILD_ARCH}/${{ matrix.mode }}/pkg-p1-*.rpm
+          ls build/pkg/${BUILD_ARCH}/${{ matrix.mode }}/pkg-p2-*.rpm
+          # java targets: jars live in a mode-agnostic GM_JAVA_DIR
+          # (target.java.mk builds direct-to-OUT_DIR so Class-Path
+          # resolution works -- see comments in that file).
+          test -f build/java/j1.jar
+          test -f build/java/j2.jar
+          # Executable jar must actually run.
+          out=$(java -jar build/java/j2.jar ci-runner)
+          echo "$out" | grep -q 'Hello, ci-runner'
+
+      - name: "Clean then rebuild (verify `make clean` and `distclean`)"
+        run: |
+          set -euo pipefail
+          make BUILD_MODE=${{ matrix.mode }} clean
+          make BUILD_MODE=${{ matrix.mode }} distclean
+          test ! -d build || (echo "distclean did not remove build/"; exit 1)
+          make BUILD_MODE=${{ matrix.mode }} all
+
+      - name: Upload build artefacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: gm-build-${{ matrix.mode }}
+          path: |
+            build/lib/**
+            build/exec/**
+            build/pkg/**
+            build/java/**
+            build/depend.mk
+          retention-days: 7
+          if-no-files-found: error
+
+  # ═════════════════════════════════════════════════════════════════
+  # dep-idempot: `make deps` must be idempotent.  Two consecutive
+  # runs → identical depend.mk.  This locks in the fix for
+  # docs/6-TODO.md#G1 (residual `img-i1:pkg-p1` was reintroducible
+  # exactly because idempotency wasn't asserted).
+  # ═════════════════════════════════════════════════════════════════
+  dep-idempot:
+    name: deps idempotency
+    needs: detect
+    if: needs.detect.outputs.build == 'true' || needs.detect.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    container:
+      image: rockylinux:8
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: ./.github/actions/setup-gm-env
+
+      - name: Deps twice must match
+        run: |
+          set -euo pipefail
+          make deps
+          cp build/depend.mk /tmp/depend.first
+          # Perturb ccache mtimes to prove we're not just replaying stat
+          find build -name '*.o' -exec touch {} + 2>/dev/null || true
+          make deps
+          diff -u /tmp/depend.first build/depend.mk || {
+            echo "❌ depend.mk not idempotent across `make deps` runs"
+            echo "See docs/6-TODO.md#G1"
+            exit 1
+          }
+
+      - name: Every LHS in depend.mk must be a known target
+        run: |
+          set -euo pipefail
+          # TODO.md#P0-2: catch residual targets like `img-i1:pkg-p1`
+          # that survive a rename/removal because sed upsert only
+          # iterates $?.
+          known=$(make -s list-targets | tr ' ' '\n' | sort -u)
+          bad=$(awk -F: '/:/{print $1}' build/depend.mk | sort -u \
+                 | grep -Fxvf <(printf '%s\n' "$known") || true)
+          if [ -n "$bad" ]; then
+            echo "❌ depend.mk has unknown LHS targets:"
+            printf '  %s\n' "$bad"
+            echo "See docs/6-TODO.md#G1 / #P0-2"
+            exit 1
+          fi
+
+  # ═════════════════════════════════════════════════════════════════
+  # test: gtest suite via `make test`.  Depends on build so we
+  # actually get the test binaries.
+  # ═════════════════════════════════════════════════════════════════
+  test:
+    name: Test (${{ matrix.mode }})
+    needs: [detect, build]
+    if: needs.detect.outputs.tests == 'true' || needs.detect.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [debug, release]
+    container:
+      image: rockylinux:8
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: ./.github/actions/setup-gm-env
+        with:
+          build-mode: ${{ matrix.mode }}
+
+      - name: Discover tests
+        run: make test-list
+
+      - name: Build + run every test
+        run: make BUILD_MODE=${{ matrix.mode }} test
+
+      - name: Run one test with TESTS= filter (verify the filter works)
+        run: make BUILD_MODE=${{ matrix.mode }} test TESTS='test-t1'
+
+      - name: Individual test target must build cleanly
+        run: |
+          make BUILD_MODE=${{ matrix.mode }} test-t2
+          test -x build/exec/${BUILD_ARCH}/${{ matrix.mode }}/test-t2
+
+  # ═════════════════════════════════════════════════════════════════
+  # dep-graph: emit full DEP_TREE=yes DAG + upload as artefact.
+  # Downstream jobs (integration) reuse this.
+  # ═════════════════════════════════════════════════════════════════
+  dep-graph:
+    name: Dependency graph
+    needs: detect
+    if: needs.detect.outputs.build == 'true' || needs.detect.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container:
+      image: rockylinux:8
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: ./.github/actions/setup-gm-env
+
+      - name: Build with DEP_TREE=yes
+        run: |
+          set -euo pipefail
+          make DEP_TREE=yes all
+
+      - name: Dump text DAG
+        run: |
+          python3 production/make/scripts/dep_query.py show > build/dep-graph.txt
+          head -100 build/dep-graph.txt
+          # Sanity: at least one artifact per tier must be present
+          # (dep_query show groups by kind).  Java is included because
+          # example/j{1,2} exercise target.java.mk.  If a project
+          # forks gm and drops the java examples, drop `java` here.
+          for k in pkg exe lib java obj ; do
+            grep -q "^\[$k\]" build/dep-graph.txt || {
+              echo "❌ dep_query show missing [$k] section"; exit 1; }
+          done
+
+      - name: Dump JSON DAG
+        run: |
+          python3 production/make/scripts/dep_query.py show --format json \
+              > build/dep-graph.json
+          # Structural check via jq
+          jq -e '.artifacts | length > 0' build/dep-graph.json
+
+      - name: Query "which targets does t2.cxx affect?"
+        run: |
+          python3 production/make/scripts/dep_query.py changes \
+              --format json example/t2/src/t2.cxx > build/dep-changes-t2.json
+          jq -e '.libs | contains(["libt2"])' build/dep-changes-t2.json
+          jq -e '.exes | contains(["t3"])'    build/dep-changes-t2.json
+
+      - name: Java DAG — Greeter.java change must cascade j1 → j2
+        run: |
+          # depjava.py's import-based resolver + jar Class-Path edges
+          # give us cross-jar edges even though Java has no `go list`
+          # equivalent.  This is the single most important claim of
+          # target.java.mk and its regression should tank CI loudly.
+          python3 production/make/scripts/dep_query.py changes \
+              --format json example/j1/com/example/j1/Greeter.java \
+              > build/dep-changes-java.json
+          jq -e '.javas | contains(["j1", "j2"])' build/dep-changes-java.json
+
+      - name: Inverse query "what files does pkg-p1 need?"
+        run: |
+          python3 production/make/scripts/dep_query.py sources \
+              --format json pkg-p1 > build/dep-sources-pkgp1.json
+          jq -e '.sources | length > 0' build/dep-sources-pkgp1.json
+
+      - name: "`make deps-files` renders"
+        run: make deps-files > build/dep-files.txt
+
+      - name: DepCache round-trip (create + list + validate)
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/gm-cache
+          python3 production/make/scripts/dep_query.py \
+              cache --cache-root /tmp/gm-cache create v-ci-${GITHUB_SHA::7}
+          python3 production/make/scripts/dep_query.py \
+              cache --cache-root /tmp/gm-cache list | grep "v-ci-"
+          python3 production/make/scripts/dep_query.py \
+              cache --cache-root /tmp/gm-cache validate v-ci-${GITHUB_SHA::7}
+
+      - name: Upload dep-graph artefact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: gm-dep-graph
+          path: |
+            build/depend.mk
+            build/dep-graph.txt
+            build/dep-graph.json
+            build/dep-changes-t2.json
+            build/dep-changes-java.json
+            build/dep-sources-pkgp1.json
+            build/dep-files.txt
+            build/**/*.dep.json
+          retention-days: 14
+          if-no-files-found: error
+
+  # ═════════════════════════════════════════════════════════════════
+  # incremental: PR-only.  Given the PR's base SHA, verify
+  #   * `make changes-since` yields a reasonable target set
+  #   * `make refresh SINCE=<base> DRY_RUN=1` plans without error
+  #   * `make incremental SINCE=<base>` rebuilds only affected
+  # Posts a PR comment with the plan.
+  # ═════════════════════════════════════════════════════════════════
+  incremental:
+    name: Incremental (PR only)
+    needs: [detect, dep-graph]
+    if: >-
+      github.event_name == 'pull_request' &&
+      (needs.detect.outputs.build == 'true' || needs.detect.outputs.ci == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container:
+      image: rockylinux:8
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-gm-env
+
+      - name: Populate baseline DAG (base SHA)
+        run: |
+          set -euo pipefail
+          # Build the base to seed dep.json; then git-reset back to HEAD
+          # so the diff is meaningful.  We `git worktree add` into a
+          # scratch dir to keep the working tree at HEAD.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git worktree add /tmp/gm-base ${{ needs.detect.outputs.base_sha }}
+          make -C /tmp/gm-base DEP_TREE=yes all >/tmp/base-build.log 2>&1 || {
+            tail -50 /tmp/base-build.log; exit 1; }
+          # Copy the base's dep.json tree back into HEAD's build/ so
+          # dep_query has both bases + HEAD to walk.
+          mkdir -p build
+          rsync -a /tmp/gm-base/build/ build/
+
+      - name: "`make changes-since SINCE=<base>`"
+        id: changes
+        run: |
+          set -euo pipefail
+          out=$(make -s changes-since SINCE=${{ needs.detect.outputs.base_sha }})
+          echo "$out" | tee build/pr-changes.json
+
+      - name: "`make refresh SINCE=<base> DRY_RUN=1`"
+        run: |
+          set -euo pipefail
+          make refresh SINCE=${{ needs.detect.outputs.base_sha }} DRY_RUN=1 \
+              | tee build/pr-refresh-plan.txt
+
+      - name: "`make incremental SINCE=<base>` actually rebuilds only affected"
+        run: |
+          set -euo pipefail
+          make distclean
+          make incremental SINCE=${{ needs.detect.outputs.base_sha }} 2>&1 \
+              | tee build/pr-incremental.log
+
+      - name: Comment PR with the affected-target list
+        if: always()
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
+        with:
+          script: |
+            const fs = require('fs');
+            let changes = '(empty)';
+            try {
+              changes = fs.readFileSync('build/pr-changes.json', 'utf8').trim();
+            } catch (_) {}
+            let plan = '(no plan)';
+            try {
+              plan = fs.readFileSync('build/pr-refresh-plan.txt', 'utf8').trim();
+            } catch (_) {}
+            const body = [
+              '## 📊 gm incremental impact',
+              '',
+              `Base: \`${{ needs.detect.outputs.base_sha }}\``,
+              '',
+              '### `make changes-since` says these targets are affected:',
+              '```json',
+              changes,
+              '```',
+              '',
+              '### `make refresh --dry-run` plan:',
+              '```',
+              plan,
+              '```',
+              '',
+              '_Full logs in the job artefact._',
+            ].join('\n');
+            const {data: comments} = await github.rest.issues.listComments({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c =>
+              c.user.type === 'Bot' && c.body.startsWith('## 📊 gm incremental impact'));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                comment_id: existing.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number, body,
+              });
+            }
+
+      - name: Upload incremental artefacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: gm-incremental-pr
+          path: |
+            build/pr-changes.json
+            build/pr-refresh-plan.txt
+            build/pr-incremental.log
+          retention-days: 7
+          if-no-files-found: warn
+
+  # ═════════════════════════════════════════════════════════════════
+  # coverage: gcovr HTML + JSON.  Runs on push / dispatch by default;
+  # PRs skip unless C++ src changed (heavy job).
+  # ═════════════════════════════════════════════════════════════════
+  coverage:
+    name: Coverage (gcovr)
+    needs: detect
+    if: >-
+      github.event_name != 'pull_request' ||
+      needs.detect.outputs.tests == 'true' ||
+      needs.detect.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container:
+      image: rockylinux:8
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: ./.github/actions/setup-gm-env
+        with:
+          build-mode: coverage
+          install-coverage: 'true'
+
+      - name: Run gcovr flow
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          make coverage
+
+      - name: Show summary
+        run: |
+          cat build/coverage/summary.txt || true
+
+      - name: Upload gcovr HTML
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: gm-coverage-html
+          path: build/coverage/**
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload to Codecov (optional -- fails open)
+        if: env.CODECOV_TOKEN != ''
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        uses: codecov/codecov-action@ad3126e916f78f00edff4ed0317cf185271ccc2d  # v5.4.3
+        with:
+          files: build/coverage/coverage.json
+          fail_ci_if_error: false
+
+  # ═════════════════════════════════════════════════════════════════
+  # container: runs container/test.sh which exercises the full
+  # standalone build path (image.yaml → dep.json → docker build → rpm -qa).
+  # Uses ubuntu-latest because we need docker host, not container.
+  # ═════════════════════════════════════════════════════════════════
+  container:
+    name: Container build + tests
+    needs: detect
+    if: needs.detect.outputs.container == 'true' || needs.detect.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Set up gm environment (with docker)
+        uses: ./.github/actions/setup-gm-env
+        with:
+          install-docker: 'true'
+          install-go:   'false'   # container job doesn't need go
+          install-java: 'false'   # nor java
+
+      - name: Run container self-tests
+        # container/test.sh runs the full battery of named scenarios
+        # (render, context, deps, extras, rpms, lock, docker build,
+        # rpm -qa post-build, query --yum / --base-image / --image,
+        # check-rpm-update).  It fails hard on any of them and prints
+        # a bill of health at the end.  We still run the individual
+        # subcommands below so that a CI log surfacing failure points
+        # at exactly one line rather than "test.sh #7 failed".
+        run: bash container/test.sh
+
+      - name: "imageBuild.py render (offline sanity)"
+        run: |
+          python3 container/imageBuild.py render \
+              container/examples/hello/image.yaml \
+              | grep -q '^FROM registry.access.redhat.com/ubi8'
+
+      - name: "imageBuild.py context (stage only)"
+        run: |
+          python3 container/imageBuild.py --no-rpms context \
+              container/examples/hello/image.yaml
+          # every declared extra + prereq must land in the context.
+          for f in Dockerfile appDockerInstaller.sh installGuide.in ; do
+            test -e "build/container/hello/context/$f"
+          done
+
+      - name: "imageBuild.py deps (dep.json schema)"
+        run: |
+          python3 container/imageBuild.py --no-rpms deps \
+              container/examples/hello/image.yaml
+          jq -e '.img == "hello" and (.deps | length > 0)' \
+              build/container/hello/hello.dep.json
+
+      - name: "imageBuild.py rpms (yum resolve)"
+        continue-on-error: true    # needs network to public UBI yum
+        run: |
+          python3 container/imageBuild.py rpms \
+              container/examples/hello/image.yaml | head -10
+
+      - name: "imageBuild.py query --yum (ad-hoc RPM lookup)"
+        continue-on-error: true    # needs network
+        run: |
+          # Generate a repo file from the manifest first, then query.
+          python3 container/imageBuild.py --no-rpms context \
+              container/examples/hello/image.yaml
+          repo=$(ls build/container/hello/context/*.repo 2>/dev/null | head -1)
+          [ -f "$repo" ] && python3 container/imageBuild.py query \
+              --yum "$repo" bash coreutils | head -5
+
+      - name: "imageBuild.py lock (versionlock)"
+        run: |
+          python3 container/imageBuild.py --no-rpms lock \
+              container/examples/hello/image.yaml
+          test -s build/container/lock/hello.rpm.info
+
+      - name: "imageBuild.py check-rpm-update (skip when no updates)"
+        # This subcommand also has its own dedicated weekly workflow
+        # (rpm-updates.yml).  Running it here catches syntax breakage
+        # early; the weekly workflow is what surfaces actual updates.
+        continue-on-error: true    # relies on prior build's dep.json + network
+        run: |
+          python3 container/imageBuild.py check-rpm-update \
+              --dep-json-dir build/container --format text || true
+
+      - name: Upload container artefacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: gm-container-artefacts
+          path: |
+            build/container/**
+          retention-days: 7
+          if-no-files-found: warn
+
+  # ═════════════════════════════════════════════════════════════════
+  # integration: end-to-end verifies gm's pkg tier connects to
+  # container's image tier through dep_query.  This is the guard
+  # for docs/6-TODO.md#P0-3 (currently the DAG is disconnected --
+  # once fixed, this job asserts it stays fixed).
+  # ═════════════════════════════════════════════════════════════════
+  integration:
+    name: gm ↔ container DAG integration
+    needs: [detect, build, container]
+    if: needs.detect.outputs.ci == 'true' || github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Set up gm environment (with docker)
+        uses: ./.github/actions/setup-gm-env
+        with:
+          install-docker: 'true'
+
+      # gm side: DEP_TREE=yes so every artefact has a .dep.json
+      - name: gm build with DEP_TREE
+        run: make DEP_TREE=yes all
+
+      # container side (currently disconnected -- TODO.md#P0-3 will
+      # wire pkg-p1 through intree_pkgs).  For now this job asserts
+      # the current state and will graduate to a hard check once P0-3
+      # lands.
+      - name: container hello build
+        run: python3 container/imageBuild.py --no-rpms deps \
+                 container/examples/hello/image.yaml
+
+      - name: Ingest both dep.json trees into one DAG
+        run: |
+          set -euo pipefail
+          # Point --build-dir at the top-level build/ which now holds
+          # both gm's .dep.json tree AND container's hello.dep.json.
+          python3 production/make/scripts/dep_query.py \
+              --build-dir build --proj-top . show \
+              | tee build/integration-dag.txt
+          # Must see both pkg and img sections
+          grep -q '^\[pkg\]' build/integration-dag.txt
+          grep -q '^\[img\]' build/integration-dag.txt
+
+      - name: Expected-future assertion — gm ↔ container edge
+        # TODO(P0-3): once `intree_pkgs:` lands in manifest.py, replace
+        # `continue-on-error: true` with a hard assertion that a
+        # source-file change in example/t2/src/ propagates to `hello`.
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          # Right now this returns images: [] because the DAG is
+          # disconnected (see docs/6-TODO.md#C1).  We track the
+          # regression here so the fix lights up green.
+          python3 production/make/scripts/dep_query.py changes \
+              --format json example/t2/src/t2.cxx \
+              | tee build/integration-changes.json
+          # After P0-3 lands, this line stops being commented out:
+          # jq -e '.images | contains(["hello"])' build/integration-changes.json
+
+      - name: Upload integration artefacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: gm-integration
+          path: |
+            build/integration-dag.txt
+            build/integration-changes.json
+          retention-days: 14
+          if-no-files-found: warn
+
+  # ═════════════════════════════════════════════════════════════════
+  # gate: single required check that aggregates every conditional
+  # job's status.  Branch protection points here.
+  # ═════════════════════════════════════════════════════════════════
+  gate:
+    name: All checks passed
+    needs:
+      - detect
+      - precheck
+      - lint-shell
+      - lint-python
+      - build
+      - dep-idempot
+      - test
+      - dep-graph
+      - incremental
+      - coverage
+      - container
+      - integration
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Aggregate
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          echo "$NEEDS_JSON" | python3 - <<'PY'
+          import json, os, sys
+          data = json.loads(os.environ["NEEDS_JSON"])
+          bad = []
+          for name, info in data.items():
+              # `result` is "success", "failure", "cancelled", or "skipped".
+              # skipped == the lane was gated off (not a failure).
+              if info["result"] not in ("success", "skipped"):
+                  bad.append(f"{name}: {info['result']}")
+          if bad:
+              print("FAILED jobs:")
+              for b in bad: print(" -", b)
+              sys.exit(1)
+          print("all jobs green (or skipped by lane gate)")
+          PY

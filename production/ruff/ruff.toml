@@ -1,0 +1,67 @@
+# production/ruff/ruff.toml -- ruff configuration for gm's Python
+# helper scripts.
+#
+# Native ruff config file (per ruff docs: `ruff.toml` and `pyproject.toml`
+# are equivalent; ruff.toml drops the `[tool.ruff]` prefix so every
+# key sits at top-level).  Deliberately NOT a pyproject.toml so the
+# repo root -- and now `production/` too -- avoid the "this is a
+# Python package" signal that PEP 621 filenames carry.
+#
+# All ruff invocations pass `--config production/ruff/ruff.toml`
+# explicitly; both `production/tools/precheck.sh` (local) and
+# `.github/workflows/ci.yml` (CI) do this.  Contributors who prefer
+# their editor's ruff integration can point the extension at this
+# same path.
+
+# Runtime floor we support -- matches production/mypy/mypy.ini's
+# `python_version`.  3.12 lets us use PEP 604 unions, PEP 585
+# generics, and PEP 695 `type` aliases without pyupgrade complaints.
+target-version = "py312"
+
+# Only lint code we own.  Skip generated / vendored trees; ruff won't
+# descend into build/, .git/, etc. by default but we spell out the
+# extras.
+extend-exclude = [
+    "build",
+    ".git",
+    "note",
+    "production/tools/gtest-1.14.0",
+    "container/examples",
+    "example",
+]
+
+[lint]
+# Default ruff rules (`E`, `F`) plus warnings.  Keep small on purpose --
+# broad rulesets (`ALL`, `RUF*`) generate too much noise for a
+# codebase that predates ruff.
+select = ["E", "F", "W"]
+
+# Rules we deliberately allow project-wide, with rationale:
+#
+#   E402  Module level import not at top of file.
+#         The sys.path shim in `container/imageBuild.py`,
+#         `production/make/scripts/dep_query.py`,
+#         `production/tools/depUpdate.py` MUST run before importing
+#         the shared library (pydep / pybuild) -- reordering would
+#         break the import.  Ruff can't tell "path bootstrap" apart
+#         from "lazy conditional import", so we allow it globally
+#         and rely on code review.
+#
+#   E701  Multiple statements on one line (colon).
+#         The `elif kind == Kind.LIB:  report.libs.add(target)` ladder
+#         in `pydep/image_walk.py` is deliberate: five parallel one-
+#         liners read as a lookup table, which is exactly the shape
+#         of the code.  Expanding to five two-line blocks would hide
+#         the pattern.
+#
+#   E501  Line too long.
+#         Some docstrings + long jq snippets in helper scripts run
+#         past 88 cols; enforcing a hard wrap would hurt readability
+#         more than it helps.
+ignore = ["E402", "E701", "E501"]
+
+[lint.per-file-ignores]
+# `__init__.py` files use star-like re-exports; `__all__` handles
+# F401 for the public surface but explicitly opting-out per file is
+# clearer than depending on `__all__` being declared.
+"**/__init__.py" = ["F401"]

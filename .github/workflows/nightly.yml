@@ -1,0 +1,189 @@
+name: Nightly
+
+# ─────────────────────────────────────────────────────────────────────
+# Runs the heavy lanes that PR CI skips: full BUILD_MODE matrix
+# (debug + release + coverage), the lcov coverage flow (Perl deps
+# make it slow to install), a from-scratch `make refresh` on the
+# tip of main, and end-to-end container integration WITHOUT the
+# lane gating (so we notice if anything silently regressed).
+#
+# Trigger: 03:17 UTC daily + manual dispatch.  Late enough that
+# any main-branch push has landed and been mirrored, early enough
+# that the artefacts are ready before the working day.
+# ─────────────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+  # Also let PRs opt-in via a label -- handy for exercising the full
+  # matrix when a change looks risky.
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents:      read
+  pull-requests: write
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUILD_ARCH: rhlinux
+  MAKEFLAGS: -j2 --no-print-directory
+
+jobs:
+  # Only run on schedule/dispatch OR when the label is 'run-nightly'.
+  guard:
+    name: Should nightly run?
+    runs-on: ubuntu-latest
+    outputs:
+      go: ${{ steps.decide.outputs.go }}
+    steps:
+      - id: decide
+        run: |
+          set -euo pipefail
+          case "${{ github.event_name }}" in
+            schedule|workflow_dispatch) echo "go=true" >> "$GITHUB_OUTPUT" ;;
+            pull_request)
+              if [ "${{ github.event.label.name }}" = "run-nightly" ]; then
+                echo "go=true" >> "$GITHUB_OUTPUT"
+              else
+                echo "go=false" >> "$GITHUB_OUTPUT"
+              fi ;;
+            *) echo "go=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+  # ═════════════════════════════════════════════════════════════════
+  # full-matrix: every BUILD_MODE, every OS family.  Any breakage
+  # here is either a regression or an environment-shift (e.g. Rocky
+  # 8 EOL).
+  # ═════════════════════════════════════════════════════════════════
+  full-matrix:
+    name: Build/test (${{ matrix.mode }} on ${{ matrix.os }})
+    needs: guard
+    if: needs.guard.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [debug, release, coverage]
+        os:   [rockylinux:8, rockylinux:9]
+    container:
+      image: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Set up gm environment
+        uses: ./.github/actions/setup-gm-env
+        with:
+          build-mode: ${{ matrix.mode }}
+          install-coverage: ${{ matrix.mode == 'coverage' && 'true' || 'false' }}
+
+      - name: Full build + tests
+        # BUILD_MODE=coverage uses the coverage.mk pipeline (`make
+        # coverage`), the other two use plain `make all` + `make test`.
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.mode }}" = "coverage" ]; then
+            export PATH="$HOME/.local/bin:$PATH"
+            make coverage
+            # And lcov fallback (TODO.md#U6 wants COVERAGE_TOOL=)
+            make coverage-lcov || echo "lcov fallback failed (non-fatal)"
+          else
+            make BUILD_MODE=${{ matrix.mode }} all
+            make BUILD_MODE=${{ matrix.mode }} test
+          fi
+
+      - name: Upload artefacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: nightly-${{ matrix.os }}-${{ matrix.mode }}
+          path: |
+            build/lib/**
+            build/exec/**
+            build/pkg/**
+            build/coverage/**
+            build/depend.mk
+          retention-days: 14
+          if-no-files-found: warn
+
+  # ═════════════════════════════════════════════════════════════════
+  # deps-refresh: exercise the closed-loop `make refresh` starting
+  # from a wiped tree.  Sanity: after refresh, the DAG must know
+  # every target in `make list-targets`.
+  # ═════════════════════════════════════════════════════════════════
+  deps-refresh:
+    name: Closed-loop `make refresh`
+    needs: guard
+    if: needs.guard.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container:
+      image: rockylinux:8
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: ./.github/actions/setup-gm-env
+
+      - name: "`make distclean && make refresh` on tip"
+        run: |
+          set -euo pipefail
+          make distclean
+          # Completeness-only refresh: builds every target with
+          # DEP_TREE=yes so the DAG becomes fully populated.
+          make refresh
+
+      - name: Every list-target must have a .dep.json
+        run: |
+          set -euo pipefail
+          # This is the assertion depUpdate.py implicitly closes:
+          # after refresh, no target may be "unknown to the DAG".
+          python3 - <<'PY'
+          import subprocess, sys
+          from pathlib import Path
+          sys.path.insert(0, "production/tools")
+          from pydep import DepGraph
+          g = DepGraph(Path("build").resolve(), Path(".").resolve()).load()
+          known = {info.get("target") for info in g.artifacts.values()
+                   if info.get("target")}
+          all_t = set(subprocess.check_output(
+              ["make", "-s", "list-targets"], text=True).split())
+          missing = all_t - known
+          if missing:
+              print(f"❌ Targets missing dep.json after refresh: {sorted(missing)}")
+              sys.exit(1)
+          print(f"✅ every one of {len(all_t)} targets has a dep.json entry")
+          PY
+
+  # ═════════════════════════════════════════════════════════════════
+  # container-integration: heavy end-to-end.  A full docker build
+  # every night ensures the container/ pipeline hasn't rotted
+  # against upstream UBI or public yum repos.
+  # ═════════════════════════════════════════════════════════════════
+  container-integration:
+    name: Container end-to-end
+    needs: guard
+    if: needs.guard.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Set up gm environment (with docker)
+        uses: ./.github/actions/setup-gm-env
+        with:
+          install-docker: 'true'
+
+      - name: Full container test suite
+        run: bash container/test.sh
+
+      - name: Full docker build (real image)
+        # test.sh already covers this, but do it once more standalone
+        # to catch layer-cache / registry issues that only surface on
+        # a clean daemon.
+        run: |
+          python3 container/imageBuild.py build \
+              container/examples/hello/image.yaml

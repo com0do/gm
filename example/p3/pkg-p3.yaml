@@ -1,0 +1,16 @@
+pkg:         pkg-p3
+description: multi-pkg demo -- packages libt2 alongside pkg-p2
+
+component:
+  name:      gm/example/p3
+  id:        '000.003.000.000.000.000'
+  major_version: '2'
+  minor_version: '5'
+  comp_type: application
+
+files:
+  Impl_Libraries64:
+    - $GM_LIB_DIR/libt2.so
+    - $GM_LIB_DIR/libvlib_extra.so
+    - $GM_LIB_DIR/libvlib.so
+    - $GM_LIB_DIR/libvlib.a

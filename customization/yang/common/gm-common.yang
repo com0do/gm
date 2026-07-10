@@ -1,0 +1,95 @@
+module gm-common {
+  yang-version 1.1;
+  namespace "urn:gm:common";
+  prefix gmc;
+
+  organization "gm";
+  contact      "gm-dev@example.com";
+  description  "Shared groupings + typedefs used across every gm pkg's
+                config module.  Kept minimal and vanilla RFC 7950 --
+                no vendor extensions -- so it works with sysrepo /
+                libyang / any standard YANG toolchain.";
+
+  revision 2026-08-02 {
+    description "Initial release.";
+  }
+
+  //---------------------------------------------------------------------
+  // Typedefs
+  //---------------------------------------------------------------------
+
+  typedef log-level {
+    type enumeration {
+      enum FATAL;
+      enum ERROR;
+      enum WARN;
+      enum INFO;
+      enum DEBUG;
+      enum TRACE;
+    }
+    description "Standard log-level enum.  Consumed by every pkg.";
+  }
+
+  typedef port-number {
+    type uint16 {
+      range "1..65535";
+    }
+    description "TCP/UDP port.";
+  }
+
+  typedef timeout-ms {
+    type uint32 {
+      range "10..600000";
+    }
+    units "milliseconds";
+    description "Bounded millisecond timeout.  Sub-10ms is almost always
+                 a bug; over-10min blocks operators from responding.";
+  }
+
+  //---------------------------------------------------------------------
+  // Common groupings
+  //---------------------------------------------------------------------
+
+  grouping process-identity {
+    description "Standard identity block every pkg carries.";
+    leaf name {
+      type string;
+      mandatory true;
+      description "Human-readable name of this pkg instance.";
+    }
+    leaf log-level {
+      type log-level;
+      default INFO;
+    }
+  }
+
+  grouping http-endpoint {
+    description "Standard HTTP client configuration.";
+    leaf host {
+      type inet-host;
+      mandatory true;
+    }
+    leaf port {
+      type port-number;
+      default 80;
+    }
+    leaf timeout-ms {
+      type timeout-ms;
+      default 5000;
+    }
+  }
+
+  //---------------------------------------------------------------------
+  // Minimal inet-host typedef (avoids importing ietf-inet-types, which
+  // would drag in an external module dependency for a demo tree).
+  // Production would `import ietf-inet-types { prefix inet; }` and
+  // use `inet:host` directly.
+  //---------------------------------------------------------------------
+  typedef inet-host {
+    type string {
+      pattern '([a-zA-Z0-9-]+\.)*[a-zA-Z0-9-]+'
+            + '|[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+';
+    }
+    description "Hostname or IPv4 address (subset of ietf-inet-types:host).";
+  }
+}

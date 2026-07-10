@@ -1,0 +1,38 @@
+# generic.yaml -- master default configuration for the whole product.
+#
+# One authoritative file, released with the helm chart, containing an
+# initial value for every leaf in every yang module.  Loaded once at
+# product install time; the runtime cmproxy in each container serves
+# per-pkg slices of this tree to pkg processes via the mappings in
+# ../templates/<pkg>.template.yaml.
+#
+# Modern equivalent of the reference system's `generic.xml`:
+#   - YAML instead of XML  (humans edit YAML; tooling reads either)
+#   - Vanilla, no vendor extensions
+#   - Validated offline against yang/**/*.yang by tools/validate.sh
+#
+# Editors: the yaml-language-server directive is intentionally not
+# set here (there's no single yang schema to point at; the config
+# tree is a union).  Use ./tools/validate.sh for full-fidelity checks.
+
+pkg-p2:
+  config:
+    # gmc:process-identity
+    name:              "pkg-p2-default"
+    log-level:         INFO
+
+    # backend HTTP endpoint (gmc:http-endpoint)
+    backend:
+      host:            "backend.svc.cluster.local"
+      port:            8080
+      timeout-ms:      5000
+
+    # pkg-specific knobs
+    max-inflight:      128
+    feature-flag-experimental-x: false
+
+    # routing table: one default catch-all
+    route:
+      - prefix:        "/"
+        upstream:      "backend-primary"
+        weight:        100

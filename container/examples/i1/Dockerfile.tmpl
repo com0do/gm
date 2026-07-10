@@ -1,0 +1,20 @@
+# i1 -- demo image for the gm framework
+# @VAR@ placeholders are substituted by target.img.mk.
+
+FROM @IMG_BASE@
+
+LABEL org.opencontainers.image.title="@TARGET@" \
+      org.opencontainers.image.version="@IMG_VERSION@" \
+      org.opencontainers.image.source="gm @BUILD_MODE@/@BUILD_ARCH@"
+
+# Build context (populated by target.img.mk via dep-hooks):
+#   pkg-p1-*.rpm  -- our packaged binaries + config
+#   entrypoint.sh -- launcher script
+
+COPY pkg-p1-*.rpm entrypoint.sh /tmp/
+
+RUN rpm -ivh --nodeps /tmp/pkg-p1-*.rpm && \
+    install -m 0755 /tmp/entrypoint.sh /usr/local/bin/entrypoint && \
+    rm -f /tmp/pkg-p1-*.rpm /tmp/entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/entrypoint"]

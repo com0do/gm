@@ -1,0 +1,17 @@
+# Dockerfile.standard.tmpl -- container's default 2-stage template.
+# Substitutions are documented in container/README.md.
+
+FROM @BASE@ AS build
+
+LABEL org.opencontainers.image.title="@NAME@"
+LABEL org.opencontainers.image.version="@VERSION@"
+LABEL org.opencontainers.image.created="@BUILD_DATE@"
+
+COPY . /root/container/
+RUN  sh /root/container/appDockerInstaller.sh
+
+# Stage 2: minimal final image -- copies the *result* of stage 1.
+FROM scratch
+COPY --from=build / /
+
+ENTRYPOINT [ "@ENTRYPOINT@" ]

@@ -1,0 +1,16 @@
+{
+  "_comment": [
+    "OPTIONAL: overrides for the built-in filegroup->{dir,mode,owner,group} map.",
+    "pkg-p2 does NOT set PKG_FILEGROUP_MAP -- the schema-declared default",
+    "(see filegroup_map's `default:` in production/make/schemas/pkg.schema.yaml)",
+    "already covers Binaries64 / Impl_Libraries64 / Config_OS with sensible values.",
+    "This file exists purely to show WHAT such an override looks like",
+    "when a project's install layout needs to differ.  Point at it with",
+    "`PKG_FILEGROUP_MAP := deployment/filegroup_map.example.json` in",
+    "pkg-p2.mk to try it; the shallow-merge means only the listed keys",
+    "change, everything else keeps its schema default."
+  ],
+
+  "Impl_Libraries64": { "dir": "lib64", "mode": "0644" },
+  "Config_OS":        { "dir": "etc",   "owner": "nobody" }
+}

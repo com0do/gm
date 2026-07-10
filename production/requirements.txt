@@ -1,0 +1,35 @@
+# gm Python dependencies.  Python 3.12+ (see production/ruff/ruff.toml
+# target-version, production/mypy/mypy.ini python_version, and the CI
+# matrix in .github/workflows/ci.yml).
+#
+# Install once (venv- and system-Python aware):
+#     make prereq
+# or by hand:
+#     pip install -r production/requirements.txt
+#
+# ---- runtime ----------------------------------------------------------
+# YAML loading -- pkg.yaml (target.pkg.mk YAML mode), image manifests,
+# pydep's pkg.yaml -> lib bridge.
+PyYAML>=6.0,<7
+
+# Draft 2020-12 schema validation for pkg.yaml.
+jsonschema>=4.19,<5
+
+# ---- coverage ---------------------------------------------------------
+# `make coverage` uses gcovr to aggregate .gcda/.gcno -> HTML/JSON/
+# Cobertura.  Feeds `make coverage-diff`.
+gcovr>=7.0,<9
+
+# `make coverage-diff` cross-references Cobertura XML with a git diff
+# to compute patch-level coverage.  Requires the `coverage.xml` gcovr
+# emits (already wired in `make coverage`).
+diff-cover>=8.0,<10
+
+# ---- lint -------------------------------------------------------------
+# precheck.sh probes for these and skips gracefully if missing.  Not
+# needed for `make` builds; only for `make precheck` locally / CI.
+# Bounds mirror .github/workflows/ci.yml so `make prereq` and CI stay
+# in sync (both are `<next_major` ranges; the AGENTS.md exact-pin
+# guideline applies to reference-build tooling, not our lint chain).
+ruff>=0.6,<1
+mypy>=1.10,<2

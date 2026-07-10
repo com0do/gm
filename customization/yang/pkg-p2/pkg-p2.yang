@@ -1,0 +1,66 @@
+module pkg-p2 {
+  yang-version 1.1;
+  namespace "urn:gm:pkg-p2";
+  prefix p2;
+
+  import gm-common {
+    prefix gmc;
+  }
+
+  organization "gm";
+  contact      "gm-dev@example.com";
+  description  "Configuration schema for pkg-p2 (sample product).
+                Every leaf here is authored + defaulted in
+                ../../generic/generic.yaml.  Runtime access at pkg-p2
+                is via cmproxy using ../../templates/pkg-p2.template.yaml.";
+
+  revision 2026-08-02 {
+    description "Initial release.";
+  }
+
+  container config {
+    description "Root of pkg-p2's configurable state.";
+
+    uses gmc:process-identity;
+
+    container backend {
+      description "Where pkg-p2 sends outbound RPCs.";
+      uses gmc:http-endpoint;
+    }
+
+    leaf max-inflight {
+      type uint32 {
+        range "1..10000";
+      }
+      default 128;
+      description "Maximum concurrent outstanding backend calls.";
+    }
+
+    leaf feature-flag-experimental-x {
+      type boolean;
+      default false;
+      description "Feature-flag: enable experimental path X.  Off by
+                   default; flipped on per environment.";
+    }
+
+    list route {
+      key "prefix";
+      description "Routing entries: match a URI prefix, dispatch to a
+                   named upstream.";
+      leaf prefix {
+        type string;
+        mandatory true;
+      }
+      leaf upstream {
+        type string;
+        mandatory true;
+      }
+      leaf weight {
+        type uint8 {
+          range "1..100";
+        }
+        default 100;
+      }
+    }
+  }
+}
