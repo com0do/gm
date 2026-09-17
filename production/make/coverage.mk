@@ -13,7 +13,7 @@ COV_EXES          ?= $(TARGET_EXE)
 
 _coverage-run:
 	@$(ECHO) "... rebuild with BUILD_MODE=coverage ..."
-	@GM_TREE= $(MAKE) BUILD_MODE=coverage $(if $(COV_EXES),$(COV_EXES),all)
+	@GM_TREE= $(MAKE) BUILD_MODE=coverage all
 	@$(ECHO) "... run instrumented executables (.gcda counters) ..."
 	@$(MKDIR) $(COVERAGE_DIR)
 	@find $(GM_OUT) -name '*.gcda' -delete 2>/dev/null || true
@@ -47,14 +47,14 @@ coverage: _coverage-run
 	@$(ECHO) "... Cobertura   : $(COVERAGE_DIR)/coverage.xml  (feeds \`make coverage-diff\`)"
 
 
-# Patch-level coverage: how much of the diff between $(SINCE) and
+# Patch-level coverage: how much of the diff between $(COVERAGE_SINCE) and
 # HEAD is exercised by tests?  Consumes the Cobertura XML that
 # `make coverage` already emits, so the sequence is:
 #     make coverage
-#     make coverage-diff SINCE=main
-# Defaults SINCE to origin/main (typical CI baseline); override on
-# the cmdline for other bases (HEAD~1 for last-commit-only, etc.).
-SINCE ?= origin/main
+#     make coverage-diff COVERAGE_SINCE=main
+# Use COVERAGE_SINCE (not SINCE) so this default does not leak into
+# incremental.mk's `make refresh SINCE=...` / `make changes-since`.
+COVERAGE_SINCE ?= origin/main
 
 coverage-diff:
 	@[ -f $(COVERAGE_DIR)/coverage.xml ] || { \
@@ -63,9 +63,9 @@ coverage-diff:
 	@command -v diff-cover >/dev/null 2>&1 || python3 -m diff_cover --version >/dev/null 2>&1 || { \
 	    echo "diff-cover not found; install with: pip install --user diff-cover" ; \
 	    exit 1 ; }
-	@$(ECHO) "... patch coverage: $(SINCE) -> HEAD ..."
+	@$(ECHO) "... patch coverage: $(COVERAGE_SINCE) -> HEAD ..."
 	@cd $(PROJ_TOP) && diff-cover $(COVERAGE_DIR)/coverage.xml \
-	    --compare-branch=$(SINCE) \
+	    --compare-branch=$(COVERAGE_SINCE) \
 	    --html-report $(COVERAGE_HTML)/diff.html \
 	    --json-report $(COVERAGE_DIR)/diff.json ; \
 	rc=$$? ; \

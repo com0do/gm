@@ -77,13 +77,25 @@ def known_targets(graph: DepGraph) -> set[str]:
     return out
 
 
+def _make_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Child-process env for invoking the top-level Makefile.
+
+    env.mk exports GM_TREE=1; any `make -C $(PROJ_TOP)` from Python is
+    a fresh entry (same as `GM_TREE= $(MAKE)` in project.mk)."""
+    env = os.environ.copy()
+    env["GM_TREE"] = ""
+    if extra:
+        env.update(extra)
+    return env
+
+
 def list_all_targets(proj_top: Path) -> list[str]:
     """Ask make what the full target set is (rwildcard-derived
     TARGET_ALL from project.mk).  Requires the `list-targets` phony
     defined in project.mk."""
     result = subprocess.run(
         ["make", "-s", "-C", str(proj_top), "list-targets"],
-        capture_output=True, text=True, check=True,
+        capture_output=True, text=True, check=True, env=_make_env(),
     )
     return [t for t in result.stdout.split() if t]
 
@@ -123,10 +135,7 @@ def run_make(targets: list[str], proj_top: Path, jobs: int,
     print(">>> " + " ".join(cmd))
     if dry_run:
         return
-    env = os.environ.copy()
-    if extra_env:
-        env.update(extra_env)
-    subprocess.run(cmd, check=True, env=env)
+    subprocess.run(cmd, check=True, env=_make_env(extra_env))
 
 
 # ----------------------------------------------------------------------

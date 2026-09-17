@@ -4,7 +4,6 @@
 ifeq ($(VARIABLE_MK_INCLUDED),)
 VARIABLE_MK_INCLUDED := Y
 
-OS_TYPE := Rocky
 C_PATH  := $(GMPS_TOP)_tools/rhlinux/gcc/bin/gcc
 CC_PATH := $(GMPS_TOP)_tools/rhlinux/gcc/bin/g++
 LD_PATH := $(GMPS_TOP)_tools/rhlinux/gcc/bin/g++

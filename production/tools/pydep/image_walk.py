@@ -117,9 +117,9 @@ class ImageWalker:
         return report
 
     # -- inverse queries (image -> its transitive deps) -----------------
-    def sources_of(self, image_target: str) -> Set[str]:
-        """Every file this image (transitively) depends on."""
-        art = self._find_image_artifact(image_target)
+    def sources_of(self, root_target: str) -> Set[str]:
+        """Every file this root artefact (img/pkg/exe) transitively needs."""
+        art = self._find_root_artifact(root_target)
         if not art:
             return set()
         return self._descend(art) - {art}
@@ -133,8 +133,15 @@ class ImageWalker:
 
     # -- helpers --------------------------------------------------------
     def _find_image_artifact(self, target: str) -> str | None:
+        return self._find_root_artifact(target, kinds=frozenset({Kind.IMG}))
+
+    def _find_root_artifact(
+        self, target: str, kinds: frozenset[str] | None = None,
+    ) -> str | None:
+        if kinds is None:
+            kinds = frozenset({Kind.IMG, Kind.PKG, Kind.EXE})
         for a, info in self.graph.artifacts.items():
-            if info["kind"] == Kind.IMG and info["target"] == target:
+            if info["kind"] in kinds and info["target"] == target:
                 return a
         return None
 

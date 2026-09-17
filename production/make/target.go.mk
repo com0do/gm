@@ -76,11 +76,14 @@ $(_GO_FLAGS_STAMP): _go_flags_force | $(BUILD_DIR)
 	 [ -n "$$had" ] && $(ECHO) "  FLAGS   $(TARGET): go/cgo flags changed" ; \
 	 exit 0
 
+_GO_CGO_LDFLAGS := -L$(GM_LIB_DIR) -Wl,-rpath,$(GM_LIB_DIR) \
+    $(if $(filter coverage,$(BUILD_MODE)),-lgcov,)
+
 $(TARGET_BIN): $(_GO_SRCS) $(_GO_MODS) $(_GO_LDLIB_PATHS) $(GM_FRAMEWORK_MK) $(_GO_FLAGS_STAMP) | $(BUILD_DIR)
 	$(V_GO)
 	$(Q)cd $(GO_PROJ_ROOT) && \
 	    CGO_CFLAGS="-I$(GM_GEN_DIR) $${CGO_CFLAGS}" \
-	    CGO_LDFLAGS="-L$(GM_LIB_DIR) -Wl,-rpath,$(GM_LIB_DIR) $${CGO_LDFLAGS}" \
+	    CGO_LDFLAGS="$(_GO_CGO_LDFLAGS) $${CGO_LDFLAGS}" \
 	    $(GO) build $(GO_BUILD_FLAGS) -o $(TARGET_BIN) $(GO_BUILD_PKG)
 
 $(TARGET_PATH) : $(TARGET_BIN) | $(OUT_DIR)

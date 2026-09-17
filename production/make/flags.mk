@@ -6,9 +6,6 @@
 # Only internal accumulators are reset here -- child .mk's
 # `CFLAGS += ...` (loaded before this file in sub-makes) must survive.
 
-
-OS_TYPE := Rocky
-
 # Compiler binaries.  Search: vendored under ADMIN_DIR/tools/, then PATH.
 # Override C_PATH/CC_PATH/LD_PATH on the cmdline for custom toolchains.
 C_PATH      := $(firstword $(wildcard $(ADMIN_DIR)/tools/rhlinux/gcc/bin/gcc /usr/bin/gcc))
@@ -149,9 +146,9 @@ GLDFLAGS64 += -Wl,-rpath-link,$(ADMIN_DIR)/tools/icm/lib64
 GLDFLAGS64 += -Wl,-rpath-link,$(PROJ_TOP)/cmrepo/lib64
 GLDFLAGS64 += -Wl,-rpath-link,$(ADMIN_DIR)/tools/rhlinux/usr/lib64
 GLDFLAGS64 += -std=$(CXX_STD)
-GLDFLAGS_DEB   += -g -L$(GM_OUT)/lib/$(BUILD_ARCH)/debug
+GLDFLAGS_DEB   += -g -L$(GM_LIB_DIR)
 GLDFLAGS_DEB64 += -O2 -m64
-GLDFLAGS_REL   += -L$(GM_OUT)/lib/$(BUILD_ARCH)/release
+GLDFLAGS_REL   += -L$(GM_LIB_DIR)
 GLDFLAGS_REL64 += -O2 -m64
 LD_FLAGS_DEBUG   += $(GLDFLAGS64) $(GLDFLAGS_DEB) $(GLDFLAGS_DEB64)
 LD_FLAGS_RELEASE += $(GLDFLAGS64) $(GLDFLAGS_REL) $(GLDFLAGS_REL64)

@@ -1,14 +1,16 @@
 name: Set up gm build environment
 description: >-
-  Install everything gm's Makefile expects on a Rocky 8 (or ubuntu)
-  runner: gcc / g++ / ar / make, jq, python3 + PyYAML, ccache, gcovr,
-  lcov, rpmbuild, go (for `example/g1`), and shellcheck.  Also
-  provisions ccache with a stable key derived from OS + BUILD_MODE
-  so incremental C/C++ builds stay hot across PR iterations.
+  Install everything gm's Makefile expects on Rocky 9 / Rocky 8 (or
+  ubuntu) runner: gcc / g++ / binutils (ar) / make, jq, Python 3.12 +
+  PyYAML, ccache, gcovr, lcov, rpmbuild, go (for `example/g1`), and
+  shellcheck.  Also provisions ccache with a stable key derived from
+  OS + BUILD_MODE so incremental C/C++ builds stay hot across PR
+  iterations.
 
   Runs on both:
-    * `container: rockylinux:8` (the accurate build target;
+    * `container: rockylinux:9` (PR CI / production parity;
       BUILD_ARCH=rhlinux)
+    * `container: rockylinux:8` (nightly compat lane)
     * `ubuntu-latest`           (fallback for lint / docs / docker jobs)
 
   Inputs are all optional -- callers just `uses:` the action and
@@ -43,6 +45,13 @@ inputs:
     required: false
     default: 'true'
 
+outputs:
+  ccache-key:
+    description: >-
+      Primary actions/cache key for ccache.  Pass to save-gm-cache
+      after compile steps in the same job.
+    value: ${{ steps.ccache-restore.outputs.cache-primary-key }}
+
 runs:
   using: composite
   steps:
@@ -55,77 +64,91 @@ runs:
       run: |
         if [ -f /etc/rocky-release ] || [ -f /etc/redhat-release ]; then
           echo "family=rhel" >> "$GITHUB_OUTPUT"
+          # Cache keys: distinguish Rocky 8 vs 9 (glibc + RPM sets differ).
+          . /etc/os-release
+          echo "distro=${ID}-${VERSION_ID}" >> "$GITHUB_OUTPUT"
         else
           echo "family=ubuntu" >> "$GITHUB_OUTPUT"
+          echo "distro=ubuntu" >> "$GITHUB_OUTPUT"
         fi
 
-    # ────────────────────────────────────────────────────────────
-    # RHEL / Rocky path (matches production target: BUILD_ARCH=rhlinux)
-    #
-    # We cache /var/cache/dnf across runs -- dnf lays out downloaded
-    # RPMs and repodata there, and re-hitting the mirror is the slow
-    # part of a fresh dnf install.  Cache key is scoped to os-family
-    # + a hash of THIS action's inputs so a change to the package
-    # set invalidates cleanly.
-    # ────────────────────────────────────────────────────────────
+    # RHEL / Rocky: dnf cache MUST live under GITHUB_WORKSPACE.
+    # Container jobs only persist workspace paths through actions/cache;
+    # caching /var/cache/dnf directly never saves across runs.
     - name: Restore dnf cache (RHEL family)
+      id: dnf-cache
       if: steps.os.outputs.family == 'rhel'
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
       with:
-        path: |
-          /var/cache/dnf
-          /var/lib/dnf
-        # Bump the suffix (v1) if the package list below changes so
-        # old caches don't shadow the update.  Salting with `runner.os`
-        # keeps ubuntu vs rocky caches distinct.
-        key: dnf-${{ runner.os }}-v1-${{ inputs.build-mode }}-${{ inputs.install-coverage }}-${{ inputs.install-go }}-${{ inputs.install-java }}
+        path: .ci-cache/dnf
+        key: dnf-${{ steps.os.outputs.distro }}-v6-${{ inputs.install-coverage }}-${{ inputs.install-go }}-${{ inputs.install-java }}-${{ hashFiles('.github/actions/setup-gm-env/action.yml') }}
         restore-keys: |
-          dnf-${{ runner.os }}-v1-
+          dnf-${{ steps.os.outputs.distro }}-v6-
 
     - name: Install base toolchain (RHEL family)
       if: steps.os.outputs.family == 'rhel'
       shell: bash
+      env:
+        DNF_CACHE_HIT: ${{ steps.dnf-cache.outputs.cache-hit }}
       run: |
         set -euo pipefail
-        # `--setopt=keepcache=1` makes dnf preserve downloaded RPMs
-        # for the actions/cache above; otherwise dnf auto-cleans.
+        cache_root="${GITHUB_WORKSPACE}/.ci-cache/dnf"
+        mkdir -p "${cache_root}/cache" "${cache_root}/lib"
+        _dnf_opt() {
+          local key="$1" val="$2"
+          if grep -q "^${key}=" /etc/dnf/dnf.conf; then
+            sed -i "s|^${key}=.*|${key}=${val}|" /etc/dnf/dnf.conf
+          else
+            echo "${key}=${val}" >> /etc/dnf/dnf.conf
+          fi
+        }
+        _dnf_opt cachedir "${cache_root}/cache"
+        _dnf_opt persistdir "${cache_root}/lib"
+        _dnf_opt keepcache 1
+        echo "dnf actions/cache hit: ${DNF_CACHE_HIT:-unknown}"
+        meta_expire=21600
+        if [ "${DNF_CACHE_HIT:-}" = "true" ]; then
+          meta_expire=604800
+        fi
         dnf install -y --setopt=install_weak_deps=False \
             --setopt=keepcache=1 \
-            gcc gcc-c++ make ar binutils \
-            python3 python3-pip python3-pyyaml \
+            --setopt=metadata_expire="${meta_expire}" \
+            epel-release
+        dnf install -y --setopt=install_weak_deps=False \
+            --setopt=keepcache=1 \
+            --setopt=metadata_expire="${meta_expire}" \
+            gcc gcc-c++ make binutils \
             jq git which \
             rpm-build rpmdevtools \
             findutils tar gzip \
-            ccache shellcheck
-        ln -sf /usr/bin/python3 /usr/local/bin/python || true
+            expat python3.12 python3.12-pip \
+            ccache ShellCheck
+        if [ "${{ inputs.install-go }}" = "true" ]; then
+          dnf install -y --setopt=install_weak_deps=False \
+              --setopt=keepcache=1 golang || true
+        fi
+        if [ "${{ inputs.install-java }}" = "true" ]; then
+          dnf install -y --setopt=install_weak_deps=False \
+              --setopt=keepcache=1 java-11-openjdk-devel || true
+        fi
+        alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 100
+        alternatives --set python3 /usr/bin/python3.12
 
     - name: Install coverage tools (RHEL family)
       if: steps.os.outputs.family == 'rhel' && inputs.install-coverage == 'true'
       shell: bash
       run: |
         set -euo pipefail
-        dnf install -y --enablerepo=powertools --setopt=install_weak_deps=False \
+        # Rocky 8: powertools.  Rocky 9: crb (same role, renamed).
+        if dnf repolist --all 2>/dev/null | awk '{print $1}' | grep -qx crb; then
+          extra_repo=crb
+        else
+          extra_repo=powertools
+        fi
+        dnf install -y --enablerepo="${extra_repo}" \
+            --setopt=install_weak_deps=False --setopt=keepcache=1 \
             lcov perl-DateTime perl-JSON perl-App-cpanminus || true
-        python3 -m pip install --user --no-warn-script-location gcovr
-
-    - name: Install Go (RHEL family)
-      if: steps.os.outputs.family == 'rhel' && inputs.install-go == 'true'
-      shell: bash
-      run: |
-        set -euo pipefail
-        dnf install -y --setopt=install_weak_deps=False golang || true
-
-    - name: Install JDK (RHEL family)
-      if: steps.os.outputs.family == 'rhel' && inputs.install-java == 'true'
-      shell: bash
-      run: |
-        set -euo pipefail
-        # java-11-openjdk-devel is available on Rocky 8/9 without
-        # extra repos; ships javac + jar + java together.  target.java.mk
-        # calls javac/jar directly (no JAVA_HOME dance), so PATH is
-        # all we need.
-        dnf install -y --setopt=install_weak_deps=False \
-            java-11-openjdk-devel || true
+        PIP_CACHE_DIR="${GITHUB_WORKSPACE}/.ci-cache/pip" python3 -m pip install gcovr
 
     # ────────────────────────────────────────────────────────────
     # Ubuntu path (fallback for lint / docker / docs jobs)
@@ -144,6 +167,14 @@ runs:
         restore-keys: |
           apt-${{ runner.os }}-v1-
 
+    - name: Set up Python 3.12 (Ubuntu)
+      if: steps.os.outputs.family == 'ubuntu'
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+      with:
+        python-version: '3.12'
+        cache: pip
+        cache-dependency-path: production/requirements.txt
+
     - name: Install base toolchain (Ubuntu)
       if: steps.os.outputs.family == 'ubuntu'
       shell: bash
@@ -159,7 +190,6 @@ runs:
         sudo apt-get update -qq
         sudo apt-get install -y --no-install-recommends \
             build-essential ccache jq \
-            python3 python3-pip python3-yaml \
             rpm shellcheck git ca-certificates
 
     - name: Install coverage tools (Ubuntu)
@@ -168,7 +198,7 @@ runs:
       run: |
         set -euo pipefail
         sudo apt-get install -y --no-install-recommends lcov
-        python3 -m pip install --user --no-warn-script-location gcovr
+        python3 -m pip install gcovr
 
     - name: Install Go (Ubuntu)
       if: steps.os.outputs.family == 'ubuntu' && inputs.install-go == 'true'
@@ -184,38 +214,51 @@ runs:
         set -euo pipefail
         sudo apt-get install -y --no-install-recommends default-jdk-headless
 
-    # ────────────────────────────────────────────────────────────
-    # ccache: point PATH prefix at /usr/lib*/ccache so gcc/g++
-    # invocations from env.mk (`/usr/bin/gcc`) transparently
-    # cache -- and set CCACHE_DIR to a stable location we cache
-    # via actions/cache.
-    # ────────────────────────────────────────────────────────────
-    - name: Prime ccache PATH + dir
+    - name: Restore pip cache (RHEL family)
+      if: steps.os.outputs.family == 'rhel'
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+      with:
+        path: .ci-cache/pip
+        key: pip-${{ steps.os.outputs.distro }}-py3.12-${{ hashFiles('production/requirements.txt') }}
+        restore-keys: |
+          pip-${{ steps.os.outputs.distro }}-py3.12-
+
+    - name: Install gm Python runtime deps
       shell: bash
       run: |
         set -euo pipefail
-        # Rocky ships ccache wrappers at /usr/lib64/ccache/, ubuntu at
-        # /usr/lib/ccache/.  Prepend whichever exists.
-        for d in /usr/lib64/ccache /usr/lib/ccache ; do
-          [ -d "$d" ] && echo "$d" >> "$GITHUB_PATH"
-        done
-        mkdir -p "$HOME/.ccache"
-        echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
-        # Bound cache to keep the tarball reasonable across the
-        # matrix (debug + release).  10 GB is well above what
-        # gm's example/ needs but leaves room for user forks.
-        ccache -M 2G || true
+        export PIP_CACHE_DIR="${GITHUB_WORKSPACE}/.ci-cache/pip"
+        mkdir -p "$PIP_CACHE_DIR"
+        python3 -m pip install \
+            'PyYAML>=6.0,<7' 'jsonschema>=4.19,<5'
+
+    # ccache: flags.mk wraps as `ccache /usr/bin/gcc` via CCACHE_PATH env.
+    # Do NOT prepend /usr/lib*/ccache to PATH -- the wrappers need the
+    # real compiler on PATH and break bare `gcc` calls in CI scripts.
+    - name: Prime ccache
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p "${GITHUB_WORKSPACE}/.ci-cache/ccache"
+        echo "CCACHE_DIR=${GITHUB_WORKSPACE}/.ci-cache/ccache" >> "$GITHUB_ENV"
+        if command -v ccache >/dev/null 2>&1; then
+          echo "CCACHE_ENABLE=yes" >> "$GITHUB_ENV"
+          echo "CCACHE_PATH=$(command -v ccache)" >> "$GITHUB_ENV"
+          ccache -M 2G
+        fi
 
     - name: Restore ccache
-      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+      id: ccache-restore
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
       with:
-        path: ~/.ccache
-        # Keying by BUILD_MODE keeps debug + release from evicting
-        # each other; OS keeps rocky/ubuntu separated.
-        key: ccache-${{ runner.os }}-${{ inputs.build-mode }}-${{ github.sha }}
+        path: .ci-cache/ccache
+        # Stable across commits; ccache invalidates per translation unit
+        # when source/flags change.  Bump v3 or flags.mk hash when the
+        # toolchain / global compile flags change.
+        key: ccache-${{ steps.os.outputs.distro }}-${{ inputs.build-mode }}-v3-${{ hashFiles('production/make/flags.mk', 'production/make/env.mk') }}
         restore-keys: |
-          ccache-${{ runner.os }}-${{ inputs.build-mode }}-
-          ccache-${{ runner.os }}-
+          ccache-${{ steps.os.outputs.distro }}-${{ inputs.build-mode }}-v3-
+          ccache-${{ steps.os.outputs.distro }}-${{ inputs.build-mode }}-
 
     # ────────────────────────────────────────────────────────────
     # Docker (only when caller opts in -- ubuntu-latest only).
@@ -224,35 +267,10 @@ runs:
       if: inputs.install-docker == 'true' && steps.os.outputs.family == 'ubuntu'
       uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435  # v3.11.1
 
-    # ────────────────────────────────────────────────────────────
-    # Sanity: print versions so a broken CI is easy to diagnose.
-    # ────────────────────────────────────────────────────────────
     - name: Show tool versions
       shell: bash
       run: |
-        set +e
-        echo "=== toolchain ==="
-        which gcc && gcc --version | head -1
-        which g++ && g++ --version | head -1
-        which ar  && ar  --version | head -1
-        which ld  && ld  --version | head -1
-        which make && make --version | head -1
-        which python3 && python3 --version
-        which jq  && jq  --version
-        which ccache && ccache --version | head -1
-        which rpmbuild && rpmbuild --version
-        which shellcheck && shellcheck --version | head -3
-        if [ "${{ inputs.install-go }}" = "true" ]; then
-          which go && go version
-        fi
-        if [ "${{ inputs.install-java }}" = "true" ]; then
-          which javac && javac -version 2>&1 | head -1
-          which jar   && jar --version 2>&1 | head -1
-          which java  && java -version 2>&1 | head -1
-        fi
-        if [ "${{ inputs.install-coverage }}" = "true" ]; then
-          which gcovr && gcovr --version | head -1
-          which lcov  && lcov  --version | head -1
-        fi
-        echo "=== python3 modules ==="
-        python3 -c 'import yaml; print("PyYAML", yaml.__version__)'
+        /usr/bin/gcc --version | head -1
+        python3 --version
+        command -v ccache >/dev/null && ccache --version | head -1
+        python3 -c 'import yaml, jsonschema; print("PyYAML", yaml.__version__)'
