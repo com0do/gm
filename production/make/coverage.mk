@@ -1,19 +1,19 @@
 # SPDX-License-Identifier: MIT
 #
 # coverage.mk -- coverage subsystem.  `make coverage` (gcovr) or `make coverage-lcov`.
-# Both rebuild in BUILD_MODE=coverage, run every exe (or COV_EXES),
-# aggregate .gcno+.gcda into $(GM_COVERAGE_DIR).
+# Both rebuild with COVERAGE=1, run every exe (or COV_EXES) and then the unit
+# tests, aggregate .gcno+.gcda into $(GM_COVERAGE_DIR).
 
 .PHONY: coverage coverage-lcov coverage-diff _coverage-run
 
 COVERAGE_DIR      := $(GM_COVERAGE_DIR)
 COVERAGE_HTML     := $(COVERAGE_DIR)/html
-COVERAGE_EXEC_DIR := $(GM_OUT)/exec/$(BUILD_ARCH)/coverage
+COVERAGE_EXEC_DIR := $(GM_OUT)/exec/$(BUILD_ARCH)/$(call _gm_dir_for,$(_VAR_TAGS_SAN) cov)
 COV_EXES          ?= $(TARGET_EXE)
 
 _coverage-run:
-	@$(ECHO) "... rebuild with BUILD_MODE=coverage ..."
-	@GM_TREE= $(MAKE) BUILD_MODE=coverage $(if $(COV_EXES),$(COV_EXES),all)
+	@$(ECHO) "... rebuild with COVERAGE=1 ..."
+	@GM_TREE= $(MAKE) COVERAGE=1 all
 	@$(ECHO) "... run instrumented executables (.gcda counters) ..."
 	@$(MKDIR) $(COVERAGE_DIR)
 	@find $(GM_OUT) -name '*.gcda' -delete 2>/dev/null || true
@@ -22,6 +22,8 @@ _coverage-run:
 	    [ -x $$bin ] && { $(ECHO) "    run $$bin" ; $$bin || true ; } || \
 	        $(ECHO) "    SKIP $$exe (no exe at $$bin)" ; \
 	done
+	@$(ECHO) "... run the unit tests ..."
+	@GM_TREE= $(MAKE) COVERAGE=1 test
 
 coverage: _coverage-run
 	@command -v gcovr >/dev/null 2>&1 || { \
@@ -47,14 +49,14 @@ coverage: _coverage-run
 	@$(ECHO) "... Cobertura   : $(COVERAGE_DIR)/coverage.xml  (feeds \`make coverage-diff\`)"
 
 
-# Patch-level coverage: how much of the diff between $(SINCE) and
+# Patch-level coverage: how much of the diff between $(COVERAGE_SINCE) and
 # HEAD is exercised by tests?  Consumes the Cobertura XML that
 # `make coverage` already emits, so the sequence is:
 #     make coverage
-#     make coverage-diff SINCE=main
-# Defaults SINCE to origin/main (typical CI baseline); override on
-# the cmdline for other bases (HEAD~1 for last-commit-only, etc.).
-SINCE ?= origin/main
+#     make coverage-diff COVERAGE_SINCE=main
+# Use COVERAGE_SINCE (not SINCE) so this default does not leak into
+# incremental.mk's `make refresh SINCE=...` / `make changes-since`.
+COVERAGE_SINCE ?= origin/main
 
 coverage-diff:
 	@[ -f $(COVERAGE_DIR)/coverage.xml ] || { \
@@ -63,9 +65,9 @@ coverage-diff:
 	@command -v diff-cover >/dev/null 2>&1 || python3 -m diff_cover --version >/dev/null 2>&1 || { \
 	    echo "diff-cover not found; install with: pip install --user diff-cover" ; \
 	    exit 1 ; }
-	@$(ECHO) "... patch coverage: $(SINCE) -> HEAD ..."
+	@$(ECHO) "... patch coverage: $(COVERAGE_SINCE) -> HEAD ..."
 	@cd $(PROJ_TOP) && diff-cover $(COVERAGE_DIR)/coverage.xml \
-	    --compare-branch=$(SINCE) \
+	    --compare-branch=$(COVERAGE_SINCE) \
 	    --html-report $(COVERAGE_HTML)/diff.html \
 	    --json-report $(COVERAGE_DIR)/diff.json ; \
 	rc=$$? ; \

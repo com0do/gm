@@ -20,7 +20,8 @@ $(error gm: $(_TARGET_DUPES) must be unique.)
 endif
 
 # System-lib inventory for the opt-in LDLIB_CHECK.  
-_GM_SYS_LIB_PATHS := /usr/lib64 /usr/lib /usr/local/lib64 /usr/local/lib /lib64 /lib
+_GM_SYS_LIB_PATHS := /usr/lib64 /usr/lib /usr/local/lib64 /usr/local/lib /lib64 /lib \
+    $(wildcard /usr/lib/*-linux-gnu /usr/local/lib/*-linux-gnu /lib/*-linux-gnu)
 GM_SYS_LIBS := $(if $(filter 1,$(LDLIB_CHECK)),$(call _SCAN_LIB_DIRS,$(_GM_SYS_LIB_PATHS)))
 
 # $(call _CLASSIFY, <name>, <srcdir>, <mkfile>)
@@ -49,7 +50,7 @@ $(1)_relpath := $(4)
 $(1)_mkfile  := $(2)
 $(1): override TYPE       := $$($(1)_type)
 $(1): override SOURCE_DIR := $(3)
-$(1): override BUILD_DIR  := $(GM_OUT)/$(4)/$(BUILD_ARCH)/$(BUILD_MODE)
+$(1): override BUILD_DIR  := $(GM_OUT)/$(4)/$(BUILD_ARCH)/$(GM_MODE_DIR)
 $(1): override OUT_DIR    := $$(call _OUT_DIR_FOR,$$($(1)_type))
 $(1): override REL_DIR    := $(GM_RELEASE_DIR)
 endef
@@ -68,7 +69,7 @@ TARGET_IMPORT_EXE := $(call FILTER_FUNC,import-exe)
 define SET_HEADER_TARGET
 $(1)-header: override TYPE       := pkg
 $(1)-header: override SOURCE_DIR := $$($(1)_srcdir)
-$(1)-header: override BUILD_DIR  := $(GM_OUT)/$$($(1)_relpath)/$(BUILD_ARCH)/$(BUILD_MODE)
+$(1)-header: override BUILD_DIR  := $(GM_OUT)/$$($(1)_relpath)/$(BUILD_ARCH)/$(GM_MODE_DIR)
 $(1)-header: override OUT_DIR    := $(GM_PKG_DIR)
 $(1)-header: override REL_DIR    := $(GM_RELEASE_DIR)
 endef
@@ -99,6 +100,8 @@ help:
 	@$(ECHO) '  V=1                     show raw compile commands'
 	@$(ECHO) '  -jN                     parallel build'
 	@$(ECHO) '  BUILD_MODE=release      release build (default: debug)'
+	@$(ECHO) '  SANITIZE=address       AddressSanitizer on any BUILD_MODE (also undefined, thread)'
+	@$(ECHO) '  COVERAGE=1             gcov instrumentation on any BUILD_MODE (make coverage uses it)'
 	@$(ECHO) '  DEP_TREE=yes            emit .dep.json sidecars for file-level DAG'
 
 

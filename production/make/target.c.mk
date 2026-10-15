@@ -47,7 +47,7 @@ _LDLIB_UNRESOLVED := $(filter-out \
     $(patsubst lib%,%,$(filter lib%,$(TARGET_ALL))) $(GM_SYS_LIBS) $(_USER_LIB_STEMS), \
     $(patsubst -l%,%,$(filter -l%,$(LDLIBS))))
 ifneq ($(_LDLIB_UNRESOLVED),)
-$(warning $(MAKEFILE): LDLIBS entries $(_LDLIB_UNRESOLVED)) resolve to nothing.)
+$(warning $(MAKEFILE): LDLIBS entries $(_LDLIB_UNRESOLVED) resolve to nothing.)
 endif
 endif
 
@@ -77,7 +77,7 @@ CCFLAGS += -I$(GM_GEN_DIR)
 _VS_CPP := $(GM_GEN_DIR)/$(TARGET)_versionstamp.cpp
 endif
 
-BUILD_DATE    ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+BUILD_DATE    ?= $(shell date -u $(if $(SOURCE_DATE_EPOCH),-d @$(SOURCE_DATE_EPOCH)) +%Y-%m-%dT%H:%M:%SZ)
 BUILD_HOST    ?= $(shell hostname 2>/dev/null || echo unknown)
 HEADER_GEN_VARS ?=
 HEADER_GEN_VARS += TARGET BUILD_MODE BUILD_ARCH BUILD_DATE BUILD_HOST
@@ -123,8 +123,8 @@ ifeq ($(TYPE),exe)
 TARGET_PATH   := $(OUT_DIR)/$(TARGET)
 TARGET_KIND   := bin
 LINK_OUT      := $(BUILD_DIR)/$(TARGET)
-# rpath points at GM_LIB_DIR (where .so's live), not OUT_DIR.
-LINK_OPT      := -Wl,-rpath=$(GM_LIB_DIR)
+# rpath: where the in-tree .so's live (GM_LIB_DIR), see target.common.mk.
+LINK_OPT      := -Wl,-rpath=$(_GM_RPATH_LIB) $(_GM_PIE)
 LINK_LIBS     := $(LDLIBS)
 else ifeq ($(TYPE),lib)
 ifeq ($(LIB_KIND),static)
@@ -136,7 +136,10 @@ else
 TARGET_PATH   := $(OUT_DIR)/$(TARGET).so
 TARGET_KIND   := lib
 LINK_OUT      := $(BUILD_DIR)/$(TARGET).so
-LINK_OPT      := -shared -Wl,--soname,$(TARGET).so
+# -z defs (USER_GUIDE 3.14); `LIB_ZDEFS := no` in a lib's .mk opts out, sanitizer builds skip it.
+LIB_ZDEFS     ?= yes
+_GM_ZDEFS     := -Wl,-z,defs
+LINK_OPT      := -shared -Wl,--soname,$(TARGET).so $(if $(and $(filter-out no 0,$(LIB_ZDEFS)),$(if $(_SAN_LIST),,1)),$(_GM_ZDEFS))
 endif
 LINK_LIBS     :=
 else ifeq ($(TYPE),test)
@@ -145,7 +148,7 @@ else ifeq ($(TYPE),test)
 TARGET_PATH   := $(OUT_DIR)/$(TARGET)
 TARGET_KIND   := bin
 LINK_OUT      := $(BUILD_DIR)/$(TARGET)
-LINK_OPT      := -Wl,-rpath=$(GM_LIB_DIR) -pthread
+LINK_OPT      := -Wl,-rpath=$(_GM_RPATH_LIB) $(_GM_PIE) -pthread
 LINK_LIBS     := $(LDLIBS)
 
 GTEST_ROOT   ?= $(ADMIN_DIR)/tools/gtest-1.14.0
@@ -162,14 +165,14 @@ $(error target.c.mk: target type "$(TYPE)" not handled here. )
 endif
 
 
-LD_CMD = $(LD) -o $(LINK_OUT) $(LINK_OPT) $(LDFLAGS) $(OBJS) $(LDLIBS)
+LD_CMD = $(GM_LD) -o $(LINK_OUT) $(LINK_OPT) $(LDFLAGS) $(OBJS) $(LDLIBS)
 
 
 # flag-change detection
 _CFLAGS_STAMP  := $(BUILD_DIR)/.$(TARGET).cflags.stamp
 _LDFLAGS_STAMP := $(BUILD_DIR)/.$(TARGET).ldflags.stamp
-_CFLAGS_SIG    := $(CC)|$(C)|$(CFLAGS)|$(CCFLAGS)|$(INC_SOURCE_PATH)
-_LDFLAGS_SIG   := $(LD)|$(LDFLAGS)|$(LDLIBS)|$(LINK_OPT)|$(AR)|$(ARFLAGS)
+_CFLAGS_SIG    := $(GM_CXX)|$(GM_CC)|$(CFLAGS)|$(CCFLAGS)|$(INC_SOURCE_PATH)
+_LDFLAGS_SIG   := $(GM_LD)|$(LDFLAGS)|$(LDLIBS)|$(LINK_OPT)|$(AR)|$(ARFLAGS)
 .PHONY: _c_flags_force
 _c_flags_force: ;
 $(_CFLAGS_STAMP): _c_flags_force | $(BUILD_DIR)
@@ -216,10 +219,10 @@ $(_VS_CPP): $(_PKG_HEADER_FILES) $(MAKEFILE) $(ADMIN_DIR)/make/scripts/make-vers
 
 $(_VS_OBJ): $(_VS_CPP) $(_PKG_HEADER_FILES) | $(BUILD_DIR)
 	$(V_CXX)
-	$(Q)$(CC) -c -o $@ $< -I$(GM_GEN_DIR) $(CCFLAGS)
+	$(Q)$(GM_CXX) -c -o $@ $< -I$(GM_GEN_DIR) $(CCFLAGS)
 	$(Q)jq -cn --arg f '$(abspath $<)' \
 	          --arg d '$(MAKEFILE_DIR)' \
-	          --arg c '$(CC) -c $(abspath $<) -o $@ -I$(GM_GEN_DIR) $(CCFLAGS)' \
+	          --arg c '$(GM_CXX) -c $(abspath $<) -o $@ -I$(GM_GEN_DIR) $(CCFLAGS)' \
 	          --arg o '$@' \
 	          '{file:$$f, directory:$$d, command:$$c, output:$$o}' > $(@:.o=.cc.json)
 
@@ -251,6 +254,7 @@ $(TARGET) :: $(TARGET_PATH) $(DEP_JSON_ALL);
 ifneq ($(filter %.a,$(TARGET_PATH)),)
 $(BUILD_DIR)/%.a : $(OBJS) | $(BUILD_DIR)
 	$(V_AR)
+	$(Q)$(RM) $@
 	$(Q)$(AR) $(ARFLAGS) $@ $(OBJS)
 endif
 
@@ -268,31 +272,31 @@ $(TARGET_PATH) : $(OUT_DIR)/% : $(BUILD_DIR)/% | $(OUT_DIR)
 
 $(BUILD_DIR)/%.d: %$(CC_SUFFIX)|$(BUILD_DIR)
 	$(V_DEP)
-	$(Q)set -e; $(CC) -MM $(INC_SOURCE_PATH) $(CCFLAGS) $< \
+	$(Q)set -e; $(GM_CXX) -MM -MP $(INC_SOURCE_PATH) $(CCFLAGS) $< \
 	 | sed 's#\($*\)\.o[ :]*#$(basename $@).o $@ : #g' > $@; [ -s $@ ] || rm -f $@
 
 $(BUILD_DIR)/%.o: %$(CC_SUFFIX) $(MAKEFILE) $(GM_FRAMEWORK_MK)|$(BUILD_DIR)
 	$(V_CXX)
 	$(Q)$(RM) -f $@ $(TARGET_PATH)
-	$(Q)$(CC) -o $@ -c $< $(INC_SOURCE_PATH) $(CCFLAGS)
+	$(Q)$(GM_CXX) -o $@ -c $< $(INC_SOURCE_PATH) $(CCFLAGS)
 	$(Q)jq -cn --arg f '$(abspath $<)' \
 	          --arg d '$(MAKEFILE_DIR)' \
-	          --arg c '$(CC) -c $(abspath $<) -o $@ $(INC_SOURCE_PATH) $(CCFLAGS)' \
+	          --arg c '$(GM_CXX) -c $(abspath $<) -o $@ $(INC_SOURCE_PATH) $(CCFLAGS)' \
 	          --arg o '$@' \
 	          '{file:$$f, directory:$$d, command:$$c, output:$$o}' > $(@:.o=.cc.json)
 
 $(BUILD_DIR)/%.d: %.c|$(BUILD_DIR)
 	$(V_DEP)
-	$(Q)set -e; $(C) -MM $(INC_SOURCE_PATH) $(CFLAGS) $< \
+	$(Q)set -e; $(GM_CC) -MM -MP $(INC_SOURCE_PATH) $(CFLAGS) $< \
 	 | sed 's#\($*\)\.o[ :]*#$(basename $@).o $@ : #g' > $@; [ -s $@ ] || rm -f $@
 
 $(BUILD_DIR)/%.o: %.c $(MAKEFILE) $(GM_FRAMEWORK_MK)|$(BUILD_DIR)
 	$(V_CC)
 	$(Q)$(RM) -f $@ $(TARGET_PATH)
-	$(Q)$(C) -o $@ -c $< $(INC_SOURCE_PATH) $(CFLAGS)
+	$(Q)$(GM_CC) -o $@ -c $< $(INC_SOURCE_PATH) $(CFLAGS)
 	$(Q)jq -cn --arg f '$(abspath $<)' \
 	          --arg d '$(MAKEFILE_DIR)' \
-	          --arg c '$(C) -c $(abspath $<) -o $@ $(INC_SOURCE_PATH) $(CFLAGS)' \
+	          --arg c '$(GM_CC) -c $(abspath $<) -o $@ $(INC_SOURCE_PATH) $(CFLAGS)' \
 	          --arg o '$@' \
 	          '{file:$$f, directory:$$d, command:$$c, output:$$o}' > $(@:.o=.cc.json)
 
@@ -315,8 +319,8 @@ $(DEP_JSON_LINK): $(TARGET_PATH) $(DEP_JSON_OBJS) | $(OUT_DIR)
 	    $(DEP_JSON_OBJS) > $@
 
 
-.PRECIOUS: %/$(BUILD_MODE)
-%/$(BUILD_MODE):
+.PRECIOUS: %/$(GM_MODE_DIR)
+%/$(GM_MODE_DIR):
 	@$(MKDIR) $@
 %/linux64:
 	@$(MKDIR) $@

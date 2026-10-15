@@ -15,7 +15,8 @@ MAKEFILE_DIR := $(abspath $(dir $(MAKEFILE)))
 
 GM_FRAMEWORK_MK := $(GM_FRAMEWORK_CORE_MK) \
     $(CURRENT_FILE) \
-    $(ADMIN_DIR)/make/scripts/depjava.py
+    $(ADMIN_DIR)/make/scripts/depjava.py \
+    $(ADMIN_DIR)/make/scripts/jar-normalize.py
 
 include $(ADMIN_DIR)/make/target.common.mk
 
@@ -39,6 +40,9 @@ endif
 JAR_DEPS       ?=
 CLASSPATH      ?=
 JAVAC_FLAGS    ?=
+# Class-file level (default 8 runs on every JRE >= 8, whichever JDK built it).
+JAVA_RELEASE   ?= 8
+_JAVAC_TARGET  := -source $(JAVA_RELEASE) -target $(JAVA_RELEASE) -encoding UTF-8 -Xlint:-options
 JAR_FLAGS      ?=
 MAIN_CLASS     ?=
 JAVA_SRC_ROOTS ?= $(MAKEFILE_DIR)
@@ -90,13 +94,14 @@ $(GEN_MANIFEST): $(MAKEFILE) $(CURRENT_FILE) | $(BUILD_DIR)
 $(JAR_OUT): $(JAVASOURCE) $(INTREE_JARS) $(GEN_MANIFEST) $(MAKEFILE) $(GM_FRAMEWORK_MK) | $(BUILD_DIR) $(OUT_DIR)
 	$(V_JAVAC)
 	$(Q)$(RM) -r $(CLASS_DIR) ; $(MKDIR) $(CLASS_DIR)
-	$(Q)$(JAVAC) $(JAVAC_FLAGS) -d $(CLASS_DIR) $(JAVAC_CLASSPATH) $(JAVASOURCE)
+	$(Q)$(JAVAC) $(JAVAC_FLAGS) $(_JAVAC_TARGET) -d $(CLASS_DIR) $(JAVAC_CLASSPATH) $(JAVASOURCE)
 	$(V_JAR)
 	$(Q)$(JAR) cfm $@ $(GEN_MANIFEST) $(JAR_FLAGS) -C $(CLASS_DIR) .
+	$(Q)$(if $(SOURCE_DATE_EPOCH),python3 $(ADMIN_DIR)/make/scripts/jar-normalize.py $@ $(SOURCE_DATE_EPOCH),:)
 
 
-.PRECIOUS: %/$(BUILD_MODE) $(OUT_DIR)
-%/$(BUILD_MODE):
+.PRECIOUS: %/$(GM_MODE_DIR) $(OUT_DIR)
+%/$(GM_MODE_DIR):
 	$(Q)$(MKDIR) $@
 $(OUT_DIR):
 	$(Q)$(MKDIR) $@

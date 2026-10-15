@@ -52,7 +52,7 @@ TARGET_RULES_FOR = $(strip \
     $(error No recipe file for target type "$(1)")))))))
 
 _GM_CMDLINE_ROOT := PROJ_TOP='$(PROJ_TOP)' ADMIN_DIR='$(ADMIN_DIR)' \
-                    BUILD_ARCH='$(BUILD_ARCH)' BUILD_MODE='$(BUILD_MODE)' \
+                    BUILD_ARCH='$(BUILD_ARCH)' BUILD_MODE='$(BUILD_MODE)' SANITIZE='$(SANITIZE)' \
                     GM_OUT='$(GM_OUT)' DEP_TREE='$(DEP_TREE)'
 _GM_CMDLINE_PROJ  = GM_SYS_LIBS='$(GM_SYS_LIBS)' \
                     TARGET_ALL='$(TARGET_ALL)' TARGET_DEP='$(TARGET_DEP)'

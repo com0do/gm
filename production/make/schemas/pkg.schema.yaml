@@ -56,6 +56,16 @@ properties:
     description: Human-readable summary; ends up as the RPM Summary line.
     default:     ''
 
+  license:
+    type:        string
+    description: RPM License tag.
+    default:     Proprietary
+
+  group:
+    type:        string
+    description: RPM Group tag (newer rpm ignores it; kept for older consumers).
+    default:     Networking
+
   pkg_type:
     type:        string
     description: RPM shape (whole product vs. patch vs. sublibrary).

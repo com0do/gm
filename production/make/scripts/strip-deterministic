@@ -1,0 +1,6 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# strip(1) that keeps archive members' timestamps fixed: rpm's
+# brp-strip-static-archive otherwise stamps them with the current time and the
+# RPM stops being reproducible.  Wired in as %__strip by target.pkg.mk.
+exec /usr/bin/strip --enable-deterministic-archives "$@"

@@ -52,6 +52,7 @@ PROJ_TOP=$(find_proj_top) || {
 DEP_QUERY="$PROJ_TOP/production/make/scripts/dep_query.py"
 IMAGE_BUILD="$PROJ_TOP/container/imageBuild.py"
 PRECHECK="$PROJ_TOP/production/tools/precheck.sh"
+GMDBG="$PROJ_TOP/production/tools/gmdbg.py"
 
 # ANSI only on a tty.
 if [ -t 1 ]; then C_B=$'\e[1m'; C_D=$'\e[2m'; C_R=$'\e[0m'
@@ -90,13 +91,22 @@ ${C_B}QUALITY${C_R}
   gm check                    run every local static check (precheck)
   gm coverage [lcov]          coverage report (gcovr, or lcov)
 
+${C_B}DEBUG${C_R} (field crashes; docs 3.16)
+  gm core <core> [--exe E]    offline crash analysis: signal, fault, cause, missing symbols
+  gm watch --pid P --sym S    who writes this address? (hardware watchpoint, ~native speed)
+           [--kernel]         ...also catch read()/recv() writing into it
+  gm symbols add|list|find    root-free debuginfo store (debuginfo rpm / dir / ELF)
+
 ${C_B}ESCAPE HATCH${C_R}
   gm <anything else>          forwarded verbatim to \`make -C $PROJ_TOP\`
                               e.g. \`gm libt1 BUILD_MODE=release\`
 
 ${C_B}COMMON FLAGS${C_R} (pass through to make)
   -jN                         parallel
-  BUILD_MODE=debug|release|coverage
+  BUILD_MODE=debug|release
+  COVERAGE=1                  gcov instrumentation (any BUILD_MODE)
+  SANITIZE=address[,undefined]|thread   sanitizer build (any BUILD_MODE)
+  CC=<path> CXX=<path>        compilers (default: gcc/g++ on PATH)
   GM_OUT=<dir>                relocate the output tree
   DEP_TREE=yes                emit .dep.json sidecars while building
 EOF
@@ -162,6 +172,9 @@ case "$cmd" in
             gcovr) run_make coverage ;;
             *)     echo "gm coverage: expected 'gcovr' or 'lcov'" >&2; exit 2 ;;
         esac ;;
+
+    # ---- debugging (gmdbg.py) -------------------------------------
+    watch|core|symbols) exec python3 "$GMDBG" "$cmd" "$@" ;;
 
     # ---- raw dep_query (power users) ------------------------------
     dep-query|dq)     exec python3 "$DEP_QUERY" "$@" ;;

@@ -54,7 +54,7 @@ TAR      := /bin/tar
 UNAME    := /bin/uname
 
 AR       := /usr/bin/ar
-ARFLAGS  := -rcs
+ARFLAGS  := -rcsD
 
 GO       ?= $(firstword $(wildcard $(GOROOT)/bin/go) $(shell command -v go 2>/dev/null) go)
 
@@ -90,10 +90,40 @@ endif
 endif
 
 # Set `GM_VALID_MODES += <name>` in your top-level Makefile before including env.mk to add your own.
-GM_VALID_MODES ?= debug release coverage
+GM_VALID_MODES ?= debug release
 ifeq ($(filter $(BUILD_MODE),$(GM_VALID_MODES)),)
-$(error BUILD_MODE='$(BUILD_MODE)' is not in {$(GM_VALID_MODES)}.  )
+$(error BUILD_MODE='$(BUILD_MODE)' is not in {$(GM_VALID_MODES)}.$(if $(filter coverage,$(BUILD_MODE)),  Coverage is now an axis: COVERAGE=1 (or `make coverage`).))
 endif
+
+# Instrumentation axes, orthogonal to BUILD_MODE: SANITIZE (comma list of
+# address / undefined / thread) and COVERAGE=1.  GM_MODE_DIR names the output
+# tree from the sorted tags (release-asan-cov).  USER_GUIDE 3.12.
+_comma := ,
+_space := $(subst ,, )
+SANITIZE ?=
+_SAN_VALID         := address thread undefined
+_SAN_TAG_address   := asan
+_SAN_TAG_thread    := tsan
+_SAN_TAG_undefined := ubsan
+_SAN_RPM_address   := libasan
+_SAN_RPM_thread    := libtsan
+_SAN_RPM_undefined := libubsan
+_SAN_LIST := $(sort $(subst $(_comma),$(_space),$(SANITIZE)))
+ifneq ($(filter-out $(_SAN_VALID),$(_SAN_LIST)),)
+$(error SANITIZE='$(SANITIZE)': unknown entr(y/ies) $(filter-out $(_SAN_VALID),$(_SAN_LIST)).  Valid: $(_SAN_VALID) (comma separated).)
+endif
+ifneq ($(and $(filter address,$(_SAN_LIST)),$(filter thread,$(_SAN_LIST))),)
+$(error SANITIZE='$(SANITIZE)': address and thread cannot be combined (separate runtimes).)
+endif
+COVERAGE ?=
+ifneq ($(filter-out 0 no 1 yes,$(COVERAGE)),)
+$(error COVERAGE='$(COVERAGE)': use 1 or yes (empty, 0, no = off).)
+endif
+_COV          := $(filter 1 yes,$(COVERAGE))
+_VAR_TAGS_SAN := $(foreach s,$(_SAN_LIST),$(_SAN_TAG_$(s)))
+_VAR_TAGS     := $(_VAR_TAGS_SAN) $(if $(_COV),cov)
+_gm_dir_for    = $(BUILD_MODE)$(if $(strip $(1)),-$(subst $(_space),-,$(sort $(strip $(1)))))
+GM_MODE_DIR   := $(call _gm_dir_for,$(_VAR_TAGS))
 
 # Mixed lib+pkg goals refused outside DRY_RUN (dep regen visits both).
 ifneq ($(DRY_RUN),1)
@@ -112,9 +142,16 @@ endif
 # Override GM_OUT to relocate the whole output tree.
 GM_OUT ?= $(PROJ_TOP)/build
 
-GM_LIB_DIR        := $(GM_OUT)/lib/$(BUILD_ARCH)/$(BUILD_MODE)
-GM_EXEC_DIR       := $(GM_OUT)/exec/$(BUILD_ARCH)/$(BUILD_MODE)
-GM_PKG_DIR        := $(GM_OUT)/pkg/$(BUILD_ARCH)/$(BUILD_MODE)
+# Reproducible-builds timestamp: the last commit time unless set.  Exported:
+# gcc (__DATE__), BUILD_DATE, jar and rpmbuild all honour it.  USER_GUIDE 3.15.
+SOURCE_DATE_EPOCH ?= $(shell git -C $(PROJ_TOP) log -1 --format=%ct 2>/dev/null)
+ifneq ($(strip $(SOURCE_DATE_EPOCH)),)
+export SOURCE_DATE_EPOCH
+endif
+
+GM_LIB_DIR        := $(GM_OUT)/lib/$(BUILD_ARCH)/$(GM_MODE_DIR)
+GM_EXEC_DIR       := $(GM_OUT)/exec/$(BUILD_ARCH)/$(GM_MODE_DIR)
+GM_PKG_DIR        := $(GM_OUT)/pkg/$(BUILD_ARCH)/$(GM_MODE_DIR)
 GM_JAVA_DIR       := $(GM_OUT)/java
 GM_GEN_DIR        := $(GM_OUT)/gen/include/$(BUILD_ARCH)
 GM_COVERAGE_DIR   := $(GM_OUT)/coverage

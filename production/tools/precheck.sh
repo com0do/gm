@@ -91,6 +91,47 @@ fail_check()  { printf '%s ✗ %s%s\n'    "$C_RED"    "$1" "$C_RESET"; FAIL+=("$
 
 have() { command -v "$1" >/dev/null 2>&1 ; }
 
+# On GitHub Actions also raise an annotation: it is readable without the (login-gated) raw log.
+ci_error() {  # ci_error <title> <text>
+    [ "${GITHUB_ACTIONS:-}" = "true" ] || return 0
+    local msg
+    msg=$(printf '%s' "$2" | tr -d '\r' | tail -c 3800 | sed ':a;N;$!ba;s/%/%25/g;s/\n/%0A/g')
+    printf '::error title=%s::%s\n' "$1" "$msg"
+}
+
+ci_notice() {  # ci_notice <title> <text>: visible in the annotation list without the raw log
+    [ "${GITHUB_ACTIONS:-}" = "true" ] || return 0
+    printf '::notice title=%s::%s\n' "$1" "$2"
+}
+
+# Full build used by several checks; on failure show why instead of a bare "failed".
+build_or_explain() {  # build_or_explain <check name>; returns 1 and prints the tail on failure
+    local log
+    log=$(mktemp)
+    # shellcheck disable=SC1007
+    if GM_TREE= make -s >"$log" 2>&1; then
+        rm -f "$log"
+        return 0
+    fi
+    local tc rpmlog=""
+    tc="$(gcc --version 2>&1 | head -1); $(go version 2>&1 | head -1); $(javac -version 2>&1 | head -1); rpmbuild: $(command -v rpmbuild || echo none); $(python3 --version 2>&1)"
+    echo "  make failed; toolchain: $tc"
+    echo "  last lines:"
+    tail -n 25 "$log" | sed 's/^/    /'
+    # rpmbuild failures only name their log: show its tail too.
+    rpmlog=$(sed -n 's/.*rpmbuild failed (see \(.*\)).*/\1/p' "$log" | head -1)
+    if [ -n "$rpmlog" ] && [ -f "$rpmlog" ]; then
+        echo "  rpmbuild log $rpmlog (tail):"
+        tail -n 40 "$rpmlog" | cut -c1-220 | sed 's/^/    /'
+    fi
+    ci_error "$1: make failed" "toolchain: $tc
+$(tail -n 6 "$log")
+--- rpmbuild log tail ---
+$( [ -n "$rpmlog" ] && [ -f "$rpmlog" ] && tail -n 40 "$rpmlog" | cut -c1-200)"
+    rm -f "$log"
+    return 1
+}
+
 
 ########################################################################
 # Individual checks -- one function per check.
@@ -409,6 +450,12 @@ check_make_bad_ldlib() {
         fail_check "make bad-ldlib"
         return 0
     fi
+    if echo "$on_out" | grep -q 'missing separator'; then
+        echo "  LDLIB_CHECK=1 broke make itself:"
+        echo "$on_out" | grep -B1 'missing separator' | head -3 | sed 's/^/    /'
+        fail_check "make bad-ldlib"
+        return 0
+    fi
     if echo "$on_out" | grep -q 'ZZZ_PRECHECK_FAKE'; then
         ok_check "make bad-ldlib (off silent, on fires)"
     else
@@ -428,10 +475,8 @@ check_make_idempotent() {
     # Precondition: full build must complete first.  We tolerate the
     # first make's noise; the invariant is the SECOND make produces
     # zero output (no phony spam, no spurious rebuilds).
-    # shellcheck disable=SC1007
-    if ! GM_TREE= make -s >/dev/null 2>&1; then
+    if ! build_or_explain "make idempotent"; then
         fail_check "make idempotent"
-        echo "  first make failed"
         return 0
     fi
     local out
@@ -453,10 +498,8 @@ check_make_cdb() {
         skip_check "make cdb" "no make or no jq"
         return 0
     fi
-    # shellcheck disable=SC1007
-    GM_TREE= make -s >/dev/null 2>&1 || {
+    build_or_explain "make cdb" || {
         fail_check "make cdb"
-        echo "  build failed"
         return 0
     }
     if [ ! -f build/compile_commands.json ]; then
@@ -478,6 +521,164 @@ check_make_cdb() {
     else
         fail_check "make cdb"
         echo "  only $n entries (expected >=5)"
+    fi
+}
+
+# ---- 14. gm variant axes and flag groups -------------------------------
+# No compiling: env.mk + a throwaway `show` goal.  SANITIZE / COVERAGE are off
+# by default and cover compile AND link; each mode keeps its own -O level and
+# hardening; every variant gets a canonical dir; bad input is refused.
+_gm_probe() {  # _gm_probe VAR=VAL...  -> flag dump on stdout (make output, errors included)
+    printf '%b' 'show:\n\t@echo DIR=$(GM_MODE_DIR)\n\t@echo CFLAGS=$(CFLAGS)\n\t@echo CCFLAGS=$(CCFLAGS)\n\t@echo LDFLAGS=$(LDFLAGS)\n' \
+        | env GM_TREE= make -s -f production/make/env.mk -f - show "$@" 2>&1 || true
+}
+check_make_variants() {
+    start_check "14. gm variant axes (SANITIZE, COVERAGE) and per-mode flag groups"
+    if ! have make; then
+        skip_check "make variants" "no make"
+        return 0
+    fi
+    local out var mode bad=0
+    _need() {  # _need <label> <output> <egrep pattern>
+        echo "$2" | grep -Eq -- "$3" || { echo "  $1: missing /$3/"; bad=$((bad+1)); }
+    }
+    _lack() {  # _lack <label> <output> <egrep pattern>
+        echo "$2" | grep -Eq -- "$3" && { echo "  $1: unexpected /$3/"; bad=$((bad+1)); }
+    }
+    for mode in debug release; do
+        out=$(_gm_probe BUILD_MODE="$mode")
+        _need "$mode" "$out" "^DIR=$mode\$"
+        _lack "$mode" "$out" 'fsanitize|--coverage'
+        _need "$mode" "$out" '^CFLAGS=.*-fstack-protector-strong'
+        _need "$mode" "$out" '^CCFLAGS=.*-fstack-protector-strong'
+        _need "$mode" "$out" '^LDFLAGS=.*-z,relro,-z,now'
+    done
+    out=$(_gm_probe BUILD_MODE=debug);   _need debug "$out" '^CFLAGS=.* -O0( |$)'; _need debug "$out" '^CCFLAGS=.* -O0( |$)'; _lack debug "$out" 'FORTIFY|-O2'
+    out=$(_gm_probe BUILD_MODE=release); _need release "$out" '^CFLAGS=.* -O2( |$)'; _need release "$out" '^CCFLAGS=.* -O2( |$)'; _need release "$out" 'D_FORTIFY_SOURCE=2'
+    out=$(_gm_probe HARDEN=no BUILD_MODE=release); _lack HARDEN=no "$out" 'stack-protector|FORTIFY|relro'
+    out=$(_gm_probe BUILD_MODE=release SANITIZE=undefined,address)
+    _need sanitize "$out" '^DIR=release-asan-ubsan$'
+    for var in CFLAGS CCFLAGS LDFLAGS; do _need "SANITIZE $var" "$out" "^$var=.*-fsanitize=address,undefined"; done
+    out=$(_gm_probe COVERAGE=1)
+    _need coverage "$out" '^DIR=debug-cov$'
+    for var in CFLAGS CCFLAGS LDFLAGS; do _need "COVERAGE $var" "$out" "^$var=.*--coverage"; done
+    _need coverage "$out" '^CCFLAGS=.* -O0( |$)'
+    out=$(_gm_probe BUILD_MODE=release COVERAGE=yes SANITIZE=address)
+    _need "both axes" "$out" '^DIR=release-asan-cov$'
+    [ "$(echo "$out" | grep '^CCFLAGS=' | grep -oE ' -O[0-9s]' | tail -1)" = " -O0" ] \
+        || { echo "  both axes: the last -O is not -O0 (coverage must win)"; bad=$((bad+1)); }
+    _need refused "$(_gm_probe SANITIZE=thread,address)" 'SANITIZE='
+    _need refused "$(_gm_probe SANITIZE=bogus)" 'SANITIZE='
+    _need refused "$(_gm_probe COVERAGE=maybe)" 'COVERAGE='
+    _need refused "$(_gm_probe BUILD_MODE=coverage)" 'COVERAGE=1'
+    if [ "$bad" -eq 0 ]; then ok_check "make variants"
+    else fail_check "make variants"; fi
+}
+
+# ---- 15. gm compiler selection (CC / CXX / PATH) -----------------------
+# Precedence and PATH lookup (README "Toolchain"), with stub compilers.
+_gm_cc_probe() {  # _gm_cc_probe -> "C_PATH CC_PATH LD_PATH CC=<value>" on one line
+    printf '%b' 'show:\n\t@echo $(C_PATH) $(CC_PATH) $(LD_PATH) CC=$(CC)\n' \
+        | env GM_TREE= make -s -f production/make/env.mk -f - show 2>&1 || true
+}
+check_make_compiler() {
+    start_check "15. gm compiler selection (CC / CXX, else gcc / g++ on PATH; ccache shims skipped)"
+    if ! have make; then
+        skip_check "make compiler" "no make"
+        return 0
+    fi
+    local d bad=0 got f
+    d=$(mktemp -d)
+    mkdir -p "$d/bin" "$d/alt" "$d/ccache"
+    for f in bin/gcc bin/g++ alt/gcc-x alt/g++-x ccache/gcc ccache/g++; do
+        printf '#!/bin/sh\nexit 0\n' > "$d/$f"; chmod +x "$d/$f"
+    done
+    _expect() {  # _expect <label> <want> <got>
+        if [ "$2" != "$3" ]; then echo "  $1: want [$2]"; echo "  $1: got  [$3]"; bad=$((bad+1)); fi
+    }
+    got=$(PATH="$d/ccache:$d/bin:$PATH" _gm_cc_probe)
+    _expect "PATH lookup (ccache shim skipped)" "$d/bin/gcc $d/bin/g++ $d/bin/g++ CC=" "$got"
+    got=$(CC="$d/alt/gcc-x" CXX="$d/alt/g++-x" _gm_cc_probe)
+    _expect "CC/CXX from env" "$d/alt/gcc-x $d/alt/g++-x $d/alt/g++-x CC=$d/alt/gcc-x" "$got"
+    got=$(PATH="$d/alt:$PATH" CC=gcc-x CXX=g++-x _gm_cc_probe)
+    _expect "bare names resolved on PATH" "$d/alt/gcc-x $d/alt/g++-x $d/alt/g++-x CC=gcc-x" "$got"
+    got=$(CC=no-such-compiler-xyz _gm_cc_probe)
+    case "$got" in *"compiler not found"*"CC='no-such-compiler-xyz'"*) ;; *) echo "  unknown CC not diagnosed: $got"; bad=$((bad+1)) ;; esac
+    rm -rf "$d"
+    if [ "$bad" -eq 0 ]; then ok_check "make compiler"
+    else fail_check "make compiler"; fi
+}
+
+
+# ---- 16. gm core / watch / symbols (production/tools/gmdbg.py) ---------
+check_gm_debug() {
+    start_check "16. gm core / watch / symbols (real gdb on tiny crash programs)"
+    local g="$ROOT/production/tools/gmdbg.py"
+    if ! have gdb || ! have gcc || ! have python3; then
+        skip_check "gm debug tools" "needs gdb, gcc, python3"
+        return 0
+    fi
+    if ! gdb -nx -batch -ex 'python print(1)' 2>&1 | grep -q '^1$'; then
+        skip_check "gm debug tools" "gdb has no Python"
+        return 0
+    fi
+    local d bad=0 out watch_skipped=""
+    d=$(mktemp -d)
+    cat > "$d/t.c" <<'EOF'
+struct S { long a, b; };
+volatile long victim;
+__attribute__((noinline)) void stomp(void) { victim = 42; }
+__attribute__((noinline)) long deref(struct S *s) { return s->b; }
+int main(int argc, char **argv) {
+    (void)argv;
+    if (argc > 1) return (int)deref(0);
+    stomp();
+    return 0;
+}
+EOF
+    gcc -g -O0 -Wl,--build-id -o "$d/t" "$d/t.c"
+    export XDG_CACHE_HOME="$d/cache"
+    gdb -nx -batch -ex run -ex "generate-core-file $d/t.core" --args "$d/t" crash >/dev/null 2>&1
+    out=$(python3 "$g" core "$d/t.core" --exe "$d/t" 2>&1)
+    case "$out" in
+        *"embedded Python is unusable"*)
+            skip_check "gm debug tools" "gdb's embedded Python is unusable here"
+            echo "$out" | sed 's/^/    /'
+            ci_notice "gm debug tools" "SKIPPED: $out"
+            unset XDG_CACHE_HOME
+            rm -rf "$d"
+            return 0 ;;
+    esac
+    case "$out" in
+        *"NULL pointer dereference (field offset 0x8)"*"deref"*) ;;
+        *) echo "  core: missing NULL-deref analysis:"; echo "$out" | sed 's/^/    /'; bad=$((bad+1)) ;;
+    esac
+    out=$(python3 "$g" watch --sym victim --at main -n 1 -- "$d/t" 2>&1)
+    case "$out" in
+        *"refuses hardware watchpoints"*|*"no hardware watchpoint"*)
+            echo "  (watch leg skipped: no hardware watchpoints here)"
+            watch_skipped="(watch skipped: no hardware watchpoints) " ;;
+        *"write #1"*"-> 0x000000000000002a"*"stomp"*) ;;
+        *) echo "  watch: missing the writer:"; echo "$out" | sed 's/^/    /'; bad=$((bad+1)) ;;
+    esac
+    cp "$d/t" "$d/t.full"
+    cp "$d/t" "$d/t.strip"
+    strip --strip-debug "$d/t.strip"
+    if python3 "$g" symbols find "$d/t.strip" >/dev/null 2>&1; then
+        echo "  symbols: a stripped binary must be MISSING before 'add'"; bad=$((bad+1))
+    fi
+    if ! python3 "$g" symbols add "$d/t.full" >/dev/null \
+        || ! python3 "$g" symbols find "$d/t.strip" >/dev/null; then
+        echo "  symbols: add -> find round trip failed"; bad=$((bad+1))
+    fi
+    unset XDG_CACHE_HOME
+    rm -rf "$d"
+    if [ "$bad" -eq 0 ]; then
+        ok_check "gm debug tools"
+        ci_notice "gm debug tools" "ran: core + ${watch_skipped:-watch + }symbols; $(gdb --version | head -1)"
+    else
+        fail_check "gm debug tools"
+        ci_error "gm debug tools" "$out"
     fi
 }
 
@@ -503,6 +704,9 @@ ALL_CHECKS=(
     make_bad_ldlib
     make_idempotent
     make_cdb
+    make_variants
+    make_compiler
+    gm_debug
 )
 
 run_one() {

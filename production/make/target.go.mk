@@ -2,7 +2,7 @@
 #
 # target.go.mk -- Go sub-target rules.  Binary = .mk basename.
 # Knobs (all optional): GO_PROJ_ROOT (default: MAKEFILE_DIR),
-# GO_PROJ_SUBPKG, GO_BUILD_FLAGS, LDLIBS (in-tree C libs; cgo picks
+# GO_PROJ_SUBPKG, GO_BUILD_FLAGS (GO_DEFAULT_FLAGS = -buildvcs=false -trimpath), LDLIBS (in-tree C libs; cgo picks
 # them up via injected CGO_LDFLAGS -- see example/gcgo).
 # DEP_TREE=yes -> <target>.dep.json via make/scripts/depgo.sh
 # (`go list -deps` + jq).
@@ -30,6 +30,8 @@ else
 GO_PROJ_ROOT   ?= $(MAKEFILE_DIR)
 GO_PROJ_SUBPKG ?=
 GO_BUILD_FLAGS ?=
+# no VCS stamp (binary changes with every commit / dirty tree), no build paths
+GO_DEFAULT_FLAGS ?= -buildvcs=false -trimpath
 GO_BUILD_PKG   := $(if $(GO_PROJ_SUBPKG),./$(GO_PROJ_SUBPKG),.)
 
 ifeq ($(wildcard $(GO_PROJ_ROOT)/go.mod),)
@@ -65,7 +67,7 @@ _GO_LDLIB_PATHS := $(foreach _l,$(patsubst -l%,lib%,$(LDLIBS)),\
                      $(wildcard $(GM_LIB_DIR)/$(_l).a $(GM_LIB_DIR)/$(_l).so))
 
 _GO_FLAGS_STAMP := $(BUILD_DIR)/.$(TARGET).goflags.stamp
-_GO_FLAGS_SIG   := $(GO)|$(GO_BUILD_FLAGS)|$(GO_PROJ_SUBPKG)|$(LDLIBS)|$(GM_LIB_DIR)|$(GM_GEN_DIR)
+_GO_FLAGS_SIG   := $(GO)|$(GO_DEFAULT_FLAGS)|$(GO_BUILD_FLAGS)|$(GO_PROJ_SUBPKG)|$(LDLIBS)|$(GM_LIB_DIR)|$(GM_GEN_DIR)|$(C_PATH)|$(CC_PATH)
 .PHONY: _go_flags_force
 _go_flags_force: ;
 $(_GO_FLAGS_STAMP): _go_flags_force | $(BUILD_DIR)
@@ -76,19 +78,28 @@ $(_GO_FLAGS_STAMP): _go_flags_force | $(BUILD_DIR)
 	 [ -n "$$had" ] && $(ECHO) "  FLAGS   $(TARGET): go/cgo flags changed" ; \
 	 exit 0
 
+_GO_CGO_LDFLAGS := -L$(GM_LIB_DIR) -Wl,-rpath,$(_GM_RPATH_LIB) \
+    $(if $(_COV),-lgcov)
+
+# cgo: same compiler (C_PATH / CC_PATH) and sanitizer flags as the in-tree C libs;
+# `go build -asan` is Go's ASan interop (USER_GUIDE 3.12).
+_GO_ASAN    := $(if $(filter address,$(_SAN_LIST)),-asan)
+_GO_CGO_SAN := $(if $(_SAN_LIST),$(SANITIZE_FLAGS))
+
 $(TARGET_BIN): $(_GO_SRCS) $(_GO_MODS) $(_GO_LDLIB_PATHS) $(GM_FRAMEWORK_MK) $(_GO_FLAGS_STAMP) | $(BUILD_DIR)
 	$(V_GO)
 	$(Q)cd $(GO_PROJ_ROOT) && \
-	    CGO_CFLAGS="-I$(GM_GEN_DIR) $${CGO_CFLAGS}" \
-	    CGO_LDFLAGS="-L$(GM_LIB_DIR) -Wl,-rpath,$(GM_LIB_DIR) $${CGO_LDFLAGS}" \
-	    $(GO) build $(GO_BUILD_FLAGS) -o $(TARGET_BIN) $(GO_BUILD_PKG)
+	    CGO_CFLAGS="-I$(GM_GEN_DIR) $(_GO_CGO_SAN) $${CGO_CFLAGS}" \
+	    CGO_LDFLAGS="$(_GO_CGO_LDFLAGS) $(_GO_CGO_SAN) $${CGO_LDFLAGS}" \
+	    CC='$(C_PATH)' CXX='$(CC_PATH)' \
+	    $(GO) build $(_GO_ASAN) $(GO_DEFAULT_FLAGS) $(GO_BUILD_FLAGS) -o $(TARGET_BIN) $(GO_BUILD_PKG)
 
 $(TARGET_PATH) : $(TARGET_BIN) | $(OUT_DIR)
 	$(V_LN)
 	$(Q)$(LN) $(TARGET_BIN) $@
 
-.PRECIOUS: %/$(BUILD_MODE)
-%/$(BUILD_MODE):
+.PRECIOUS: %/$(GM_MODE_DIR)
+%/$(GM_MODE_DIR):
 	$(Q)$(MKDIR) $@
 
 

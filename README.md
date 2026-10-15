@@ -32,7 +32,14 @@ subdir bookkeeping.
 - **Compile / link flag change detection** — CFLAGS / CCFLAGS / LDFLAGS /
   ARFLAGS are hashed into stamp files; changing any flag rebuilds only
   the affected objects, without a `make clean`
-- Header generation (`*.h.in`), gtest test targets, gcovr / lcov coverage
+- Header generation (`*.h.in`), gtest test targets, gcovr / lcov coverage,
+  opt-in instrumentation axes (`SANITIZE=address,undefined,thread`,
+  `COVERAGE=1`), split `-debuginfo` RPMs for every package
+- Field debugging without redeploying: `gm core` (crash report with cause
+  hints), `gm watch` (who writes this address: hardware watchpoint, also
+  catches `read()`-into-buffer), `gm symbols` (root-free debuginfo store)
+- Hardened (stack protector, FORTIFY, PIE, relro/now, `$ORIGIN` RPATH) and
+  reproducible (`SOURCE_DATE_EPOCH`) by default
 - YAML-driven RPM packages (schema-validated, auto-generated spec,
   per-pkg `component.h` + versionstamp macros wired into consumers)
 - Vendored / prebuilt artefacts via `.import.mk` (multi-artefact
@@ -50,8 +57,9 @@ subdir bookkeeping.
 - **Python ≥ 3.12** (enforced by `production/ruff/ruff.toml`,
   `production/mypy/mypy.ini`, and CI)
 - Optional, per language: `rpmbuild` (pkg targets), `javac`/`jar`
-  (java), `go` (go), `gcovr` or `lcov` (coverage).  Absent tools
-  disable only the targets that need them; the rest still builds.
+  (java), `go` (go), `gcovr` or `lcov` (coverage), `libasan` /
+  `libubsan` / `libtsan` (`SANITIZE=`).  Absent tools disable only the targets that need
+  them; the rest still builds.
 
 ### System packages for the `example/` targets
 
@@ -76,6 +84,8 @@ sudo dnf install -y --setopt=install_weak_deps=False \
 python3 -m pip install --user gcovr
 sudo dnf install -y --enablerepo=powertools \
     lcov perl-DateTime perl-JSON perl-App-cpanminus
+# sanitizer builds (SANITIZE=address|undefined|thread): runtime + link-time libs
+sudo dnf install -y libasan libubsan   # + libtsan for SANITIZE=thread
 ```
 
 This matches CI's provisioning
@@ -128,9 +138,13 @@ The gm-specific entry points:
 | `make changes CHANGES="a.cc b.h"`    | which targets do these files affect?             |
 | `make refresh SINCE=<git-ref>`       | rebuild only what git-diff changed since         |
 | `make deps-snap`                     | project-relative dep cache under `build/deps/`   |
-| `make coverage`                      | gcovr HTML + JSON + txt summary                  |
+| `make coverage`                      | gcovr report: rebuild with `COVERAGE=1`, run exes + unit tests |
+| `make SANITIZE=address [test]`       | AddressSanitizer on any mode (opt-in; own `<mode>-asan/` tree) |
 | `make -jN test`                      | parallel build + parallel run of every `test-*`  |
 | `make precheck`                      | every local static check (CI parity)             |
+| `gm core <core>`                     | crash report: signal, fault, cause hints, missing symbols |
+| `gm watch --pid P --sym S --deref`   | who writes this memory? (`--kernel`: also read()/recv()) |
+| `gm symbols add <debuginfo.rpm>`     | root-free debuginfo store for `gm core` / `gm watch` |
 | `make run-<name> RUN_ARGS='...'`     | build + execute any exe/test/go target           |
 
 
@@ -216,35 +230,42 @@ recipe is [USER_GUIDE §7](docs/1-USER_GUIDE.md#7-shipping-a-sub-project-on-its-
 
 ## Toolchain
 
-Default: whatever the system's `/usr/bin/gcc` points at.  Four knobs
-swap it without touching any `.mk`:
+gm picks its compilers the way CMake / autoconf do: **`CC`** (C) and
+**`CXX`** (C++, also the link driver) from the environment or the command
+line (an absolute path, or a name on `PATH`), else the first `gcc` / `g++` on
+`PATH` (ccache masquerade dirs such as `/usr/lib64/ccache` are skipped).  That
+is all: a toolchain that ships its own compilers (a vendored gcc, a
+`gcc-toolset`) provides an `enable` script that prepends `PATH`, exactly like
+`source /opt/rh/gcc-toolset-13/enable`.
 
-| var       | default                                                                 | purpose                |
-|-----------|-------------------------------------------------------------------------|------------------------|
-| `C_PATH`  | `$(ADMIN_DIR)/tools/rhlinux/gcc/bin/gcc` if present, else `/usr/bin/gcc`| C compiler             |
-| `CC_PATH` | same idea, `g++`                                                        | C++ compiler           |
-| `LD_PATH` | same idea, `g++`                                                        | linker driver          |
-| `CXX_STD` | `c++17`                                                                 | C++ language standard  |
+gm only ever *reads* `CC` / `CXX`: its own command lines are `GM_CC` /
+`GM_CXX` / `GM_LD` (ccache-wrapped), so vendor builds (`CC ?= gcc` in
+`third_party/*/vendor`) see exactly what you chose.
+
+| var       | default                          | purpose                |
+|-----------|----------------------------------|------------------------|
+| `CXX_STD` | `c++17`                          | C++ language standard  |
 
 ### Newer gcc on Rocky 8 (gcc-toolset)
 
 Rocky 8's stock gcc 8.5 has partial C++17 and no C++20.  Install
-`gcc-toolset-13` (a good 2026 baseline), then either source its
-enable script:
+`gcc-toolset-13` (a good 2026 baseline) and use it either way (the third line is for
+Debian / Ubuntu, where versioned names exist; RHEL toolsets ship plain `gcc` / `g++`):
 
 ```bash
-source /opt/rh/gcc-toolset-13/enable   # updates PATH + LD_LIBRARY_PATH
-make -jN
+source /opt/rh/gcc-toolset-13/enable        # only prepends PATH -- gm follows PATH
+make -jN CXX_STD=c++20
+
+CC=/opt/rh/gcc-toolset-13/root/usr/bin/gcc \
+CXX=/opt/rh/gcc-toolset-13/root/usr/bin/g++ make -jN CXX_STD=c++20   # explicit
+
+make -jN CC=gcc-13 CXX=g++-13               # Debian / Ubuntu: versioned names on PATH
 ```
 
-or point the paths at it directly (better for CI):
-
-```bash
-make -jN CXX_STD=c++20 \
-     C_PATH=/opt/rh/gcc-toolset-13/root/usr/bin/gcc \
-     CC_PATH=/opt/rh/gcc-toolset-13/root/usr/bin/g++ \
-     LD_PATH=/opt/rh/gcc-toolset-13/root/usr/bin/g++
-```
+The compile-flag stamp includes the compiler path, so switching compilers in
+an existing tree rebuilds what is affected.  Keep the C and C++ compilers from the
+same toolchain (set both `CC` and `CXX`, or neither).  Not every toolset is a full
+C++ toolchain: gcc-toolset-9 here ships `gcc` only, no `g++`.
 
 ### ccache
 

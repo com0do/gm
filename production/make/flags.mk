@@ -6,14 +6,21 @@
 # Only internal accumulators are reset here -- child .mk's
 # `CFLAGS += ...` (loaded before this file in sub-makes) must survive.
 
-
-OS_TYPE := Rocky
-
-# Compiler binaries.  Search: vendored under ADMIN_DIR/tools/, then PATH.
-# Override C_PATH/CC_PATH/LD_PATH on the cmdline for custom toolchains.
-C_PATH      := $(firstword $(wildcard $(ADMIN_DIR)/tools/rhlinux/gcc/bin/gcc /usr/bin/gcc))
-CC_PATH     := $(firstword $(wildcard $(ADMIN_DIR)/tools/rhlinux/gcc/bin/g++ /usr/bin/g++))
-LD_PATH     := $(firstword $(wildcard $(ADMIN_DIR)/tools/rhlinux/gcc/bin/g++ /usr/bin/g++))
+########################################################################
+# Compilers (README "Toolchain"): CC / CXX (env or command line, an absolute path or a
+# name on PATH), else gcc / g++ on PATH (ccache shim dirs skipped).  C_PATH / CC_PATH /
+# LD_PATH are gm-internal: C compiler, C++ compiler, link driver.  CC / CXX are only
+# read; gm's own command lines are GM_CC / GM_CXX / GM_LD.
+########################################################################
+_gm_dirs  := $(filter-out %/ccache,$(subst :, ,$(PATH)))
+_gm_which  = $(if $(findstring /,$(1)),$(wildcard $(1)),$(firstword $(wildcard $(addsuffix /$(1),$(_gm_dirs)))))
+_gm_user   = $(if $(filter default undefined,$(origin $(1))),,$($(1)))
+C_PATH    := $(call _gm_which,$(or $(call _gm_user,CC),gcc))
+CC_PATH   := $(call _gm_which,$(or $(call _gm_user,CXX),g++))
+LD_PATH   := $(CC_PATH)
+ifeq ($(and $(C_PATH),$(CC_PATH)),)
+$(error gm: C / C++ compiler not found (CC='$(call _gm_user,CC)' CXX='$(call _gm_user,CXX)').  Set CC / CXX or put gcc / g++ on PATH.)
+endif
 
 ########################################################################
 # Compiler cache (ccache)
@@ -69,27 +76,40 @@ CC_INCLUDES += $(GCINCS) $(GCCINCS)
 C_INCLUDES  += $(GCINCS) $(GCINCSUSR)
 
 
+# HARDEN=no turns hardening off (USER_GUIDE 3.14).
+HARDEN ?= yes
+_HARDEN := $(if $(filter no 0,$(HARDEN)),,1)
+
 GCFLAGS         += -fPIC -DLINUX
 GCFLAGS64       += -DRTP_64BIT
-GCFLAGS_DEB     += -g -DDEBUG
+GCFLAGS_DEB     += -g -DDEBUG -O0
 GCFLAGS_DEB64   += -m64
 GCFLAGS_REL64   += -m64
-GCFLAGS_REL     +=
+# -g in every mode: symbols ship in the packages' -debuginfo RPMs (USER_GUIDE 3.13).
+GCFLAGS_REL     += -g -O2
+ifneq ($(_HARDEN),)
+GCFLAGS         += -fstack-protector-strong
+GCFLAGS_REL     += -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2
+endif
 C_FLAGS_DEBUG   += $(GCFLAGS64) $(GCFLAGS_DEB) $(GCFLAGS_DEB64)
 C_FLAGS_RELEASE += $(GCFLAGS64) $(GCFLAGS_REL) $(GCFLAGS_REL64)
 
 
 # C++17 default (gcc 7+, Rocky 8 stock gcc 8.5).  Child .mk can bump
 # via `CXX_STD := c++20` before this file loads.  For c++20/23 on
-# Rocky 8 use gcc-toolset-13+ (source /opt/rh/gcc-toolset-13/enable
-# or point C_PATH/CC_PATH at its bin).
+# Rocky 8 use gcc-toolset-13+ (source /opt/rh/gcc-toolset-13/enable, or
+# CC= / CXX= pointing at its bin).
 CXX_STD  ?= c++17
 GCCFLAGS += -fPIC -DLINUX -D_REENTRANT -D_POSIX_PTHREAD_SEMANTICS -DNM_NOT_CONFIGURED -std=$(CXX_STD)
-GCCFLAGS64 += -DRTP_64BIT -O2
+GCCFLAGS64 += -DRTP_64BIT
 GCCFLAGS_DEB64 += -m64
 GCCFLAGS_REL64 += -m64
-GCCFLAGS_DEB   += -g -DDEBUG
-GCCFLAGS_REL   +=
+GCCFLAGS_DEB   += -g -DDEBUG -O0
+GCCFLAGS_REL   += -g -O2
+ifneq ($(_HARDEN),)
+GCCFLAGS       += -fstack-protector-strong
+GCCFLAGS_REL   += -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2
+endif
 CC_FLAGS_DEBUG   += $(GCCFLAGS64) $(GCCFLAGS_DEB) $(GCCFLAGS_DEB64)
 CC_FLAGS_RELEASE += $(GCCFLAGS64) $(GCCFLAGS_REL) $(GCCFLAGS_REL64)
 
@@ -139,6 +159,8 @@ CCFLAGS += -Wall
 endif
 
 
+# build-id pairs a binary with its -debuginfo RPM.
+GLDFLAGS64 += -Wl,--build-id
 GLDFLAGS64 += -Wl,-rpath-link,$(ADMIN_DIR)/tools/icm/lib
 GLDFLAGS64 += -Wl,-rpath-link,$(PROJ_TOP)/cmrepo/lib
 GLDFLAGS64 += -Wl,-rpath-link,$(ADMIN_DIR)/tools/openssl
@@ -149,31 +171,50 @@ GLDFLAGS64 += -Wl,-rpath-link,$(ADMIN_DIR)/tools/icm/lib64
 GLDFLAGS64 += -Wl,-rpath-link,$(PROJ_TOP)/cmrepo/lib64
 GLDFLAGS64 += -Wl,-rpath-link,$(ADMIN_DIR)/tools/rhlinux/usr/lib64
 GLDFLAGS64 += -std=$(CXX_STD)
-GLDFLAGS_DEB   += -g -L$(GM_OUT)/lib/$(BUILD_ARCH)/debug
-GLDFLAGS_DEB64 += -O2 -m64
-GLDFLAGS_REL   += -L$(GM_OUT)/lib/$(BUILD_ARCH)/release
-GLDFLAGS_REL64 += -O2 -m64
+ifneq ($(_HARDEN),)
+GLDFLAGS64 += -Wl,-z,relro,-z,now
+_GM_PIE    := -pie
+endif
+GLDFLAGS_DEB   += -g -L$(GM_LIB_DIR)
+GLDFLAGS_DEB64 += -m64
+GLDFLAGS_REL   += -L$(GM_LIB_DIR)
+GLDFLAGS_REL64 += -m64
 LD_FLAGS_DEBUG   += $(GLDFLAGS64) $(GLDFLAGS_DEB) $(GLDFLAGS_DEB64)
 LD_FLAGS_RELEASE += $(GLDFLAGS64) $(GLDFLAGS_REL) $(GLDFLAGS_REL64)
 
 
-C      := $(strip $(CCACHE) $(C_PATH))
-CC     := $(strip $(CCACHE) $(CC_PATH))
-LD     := $(strip $(CCACHE) $(LD_PATH))
+# C / C++ compile and link commands (no trailing comments: make keeps the spaces).
+GM_CC  := $(strip $(CCACHE) $(C_PATH))
+GM_CXX := $(strip $(CCACHE) $(CC_PATH))
+GM_LD  := $(strip $(CCACHE) $(LD_PATH))
 CCFLAGS += $(CC_INCLUDES) $(GCCFLAGS)
 CFLAGS  += $(C_INCLUDES)  $(GCFLAGS)
 ifeq ($(BUILD_MODE), debug)
 CFLAGS  += $(C_FLAGS_DEBUG)
 CCFLAGS += $(CC_FLAGS_DEBUG)
 LDFLAGS += $(LD_FLAGS_DEBUG)
-else ifeq ($(BUILD_MODE), coverage)
-# `-fprofile-abs-path` (gcc 8+) embeds abs source paths in .gcno.
-COV_FLAGS := --coverage -fprofile-arcs -ftest-coverage -fprofile-abs-path
-CFLAGS  += $(C_FLAGS_DEBUG)   $(COV_FLAGS)
-CCFLAGS += $(CC_FLAGS_DEBUG)  $(COV_FLAGS)
-LDFLAGS += $(LD_FLAGS_DEBUG)  $(COV_FLAGS) -lgcov
 else
 CFLAGS  += $(C_FLAGS_RELEASE)
 CCFLAGS += $(CC_FLAGS_RELEASE)
 LDFLAGS += $(LD_FLAGS_RELEASE)
+endif
+
+# Coverage (COVERAGE=1): -O0 keeps line / branch attribution honest;
+# -fprofile-abs-path (gcc 8+) embeds absolute source paths in .gcno.
+ifneq ($(_COV),)
+COV_FLAGS := --coverage -fprofile-arcs -ftest-coverage -fprofile-abs-path -O0 -U_FORTIFY_SOURCE
+CFLAGS  += $(COV_FLAGS)
+CCFLAGS += $(COV_FLAGS)
+LDFLAGS += $(COV_FLAGS) -lgcov
+endif
+
+# Sanitizers (SANITIZE, env.mk): compile + link, on top of BUILD_MODE.
+ifneq ($(_SAN_LIST),)
+SANITIZE_FLAGS ?= -fsanitize=$(subst $(_space),$(_comma),$(_SAN_LIST)) -fno-omit-frame-pointer
+CFLAGS  += $(SANITIZE_FLAGS)
+CCFLAGS += $(SANITIZE_FLAGS)
+LDFLAGS += $(SANITIZE_FLAGS)
+# GCC false positives under instrumentation: warn, don't fail (USER_GUIDE 3.12).
+CFLAGS  += -Wno-error=maybe-uninitialized
+CCFLAGS += -Wno-error=maybe-uninitialized
 endif

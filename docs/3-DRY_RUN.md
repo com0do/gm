@@ -249,7 +249,7 @@ make -C example/t1 \
 
 ```make
 _GM_CMDLINE_ROOT := PROJ_TOP='$(PROJ_TOP)' ADMIN_DIR='$(ADMIN_DIR)' \
-                    BUILD_ARCH='$(BUILD_ARCH)' BUILD_MODE='$(BUILD_MODE)' \
+                    BUILD_ARCH='$(BUILD_ARCH)' BUILD_MODE='$(BUILD_MODE)' SANITIZE='$(SANITIZE)' \
                     GM_OUT='$(GM_OUT)' DEP_TREE='$(DEP_TREE)'
                     ▲
                     │ 没有 DRY_RUN，为什么？

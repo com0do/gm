@@ -88,11 +88,12 @@ The top of `env.mk` is a strict funnel:
 1. Tool paths + `MAKEFLAGS` defence (`--no-builtin-rules`,
    `--no-builtin-variables`)
 2. `BUILD_MODE ?= debug`, `BUILD_ARCH` derivation
-3. **Legality guards** — SUB_TARGET / BUILD_MODE whitelist,
-   `lib*` + `pkg*` goal-mixing refusal, deprecated `o=` alias handling.
+3. **Legality guards** — SUB_TARGET / BUILD_MODE whitelist, `SANITIZE`
+   set validation, `lib*` + `pkg*` goal-mixing refusal, `o=` alias.
    Any invalid input `$(error)`s here.
-4. Only AFTER (3) does env.mk derive `GM_LIB_DIR`, `GM_EXEC_DIR`,
-   `GM_PKG_DIR`, ... from the validated `BUILD_MODE`.
+4. Only AFTER (3) does env.mk derive `GM_MODE_DIR` and from it
+   `GM_LIB_DIR`, `GM_EXEC_DIR`, `GM_PKG_DIR`, ... from the validated
+   `BUILD_MODE` / `SANITIZE`.
 
 An earlier revision had a separate `check.mk` after env.mk;
 that was a bug — a bad `BUILD_MODE` would silently interpolate into
@@ -141,7 +142,7 @@ gm/
 │   ├── make/
 │   │   ├── env.mk                # tools + defaults + legality guards +
 │   │   │                        #   GM_OUT layout + framework file list
-│   │   ├── flags.mk              # CFLAGS/CCFLAGS/LDFLAGS accumulators
+│   │   ├── flags.mk              # CFLAGS/CCFLAGS/LDFLAGS accumulators + compiler selection (CC/CXX/PATH → GM_CC/GM_CXX/GM_LD)
 │   │   ├── project.mk            # TARGET_ALL discovery, deps rule
 │   │   ├── target.common.mk      # sub-make bootstrap (env.mk include etc.)
 │   │   ├── target.dry-run.mk     # shared DRY_RUN=1 short-circuit
@@ -169,6 +170,7 @@ gm/
 │   │   ├── dep-hooks.sh          # cp/install hook -> hooks.jsonl
 │   │   │                        #   (used by target.pkg.mk + container/)
 │   │   ├── precheck.sh           # local static-check runner (`make precheck`)
+│   │   ├── gmdbg.py              # `gm core|watch|symbols` (python CLI + gdb-side script)
 │   │   └── gtest-1.14.0/         # vendored gtest as a gm-managed lib
 │   ├── ruff/ruff.toml            # ruff config (not pyproject.toml — gm
 │   │                            #   isn't a Python package)
@@ -257,18 +259,21 @@ sorted by TYPE.  Layout mirrors reg's `ims_do/` tree:
 
 ```
 $(GM_OUT)/
-├── lib/<arch>/<mode>/            libt*.a, libt*.so   (GM_LIB_DIR)
-├── exec/<arch>/<mode>/           exe + go + test    (GM_EXEC_DIR)
-├── pkg/<arch>/<mode>/            *.rpm              (GM_PKG_DIR)
+├── lib/<arch>/<variant>/         libt*.a, libt*.so   (GM_LIB_DIR)
+├── exec/<arch>/<variant>/        exe + go + test    (GM_EXEC_DIR)
+├── pkg/<arch>/<variant>/         *.rpm + *-debuginfo.rpm (GM_PKG_DIR)
 ├── java/                          *.jar              (GM_JAVA_DIR)
 ├── gen/include/<arch>/            generated headers  (GM_GEN_DIR)
 ├── coverage/                      gcovr/lcov output  (GM_COVERAGE_DIR)
 ├── release/                       staged release     (GM_RELEASE_DIR)
 ├── depend.mk                      link-time DAG      (GM_DEP_FILE)
 ├── pkg_of.mk                      pkg-of reverse map (GM_PKG_OF_FILE)
-└── <relpath>/<arch>/<mode>/       per-target intermediates
+└── <relpath>/<arch>/<variant>/    per-target intermediates
                                    (.o, .d, .dep.json, MANIFEST.MF, ...)
 ```
+
+`<variant>` is `GM_MODE_DIR`: the `BUILD_MODE`, plus the sorted `SANITIZE` /
+`COVERAGE` tags when set (`release`, `release-asan-ubsan`, `debug-cov`).
 
 **Rule**: no gm code hard-codes `build/`.  Everything goes through
 `GM_OUT` / `GM_LIB_DIR` / etc.  This lets `make GM_OUT=/tmp/x`
@@ -340,6 +345,52 @@ $(TARGET_ALL):
 
 Everything else is set-up (`env.mk`, `project.mk`, ...) or per-type
 recipes (`target.*.mk`).
+
+### 6.1 Compiler, sanitizer and debuginfo choices
+
+- **Compiler selection** (`flags.mk`).  `CC` / `CXX` (env or cmdline), else
+  `gcc` / `g++` on `PATH`, found by a pure-make scan of `PATH` (ccache shim
+  dirs skipped).  `C_PATH` / `CC_PATH` / `LD_PATH` are gm-internal results, not
+  knobs, and not exported: env, cmdline (via `MAKEFLAGS`) and `PATH` reach every
+  sub-make, so each one resolves the same compilers.  gm's own command lines are
+  `GM_CC` / `GM_CXX` / `GM_LD`: gm used to assign `CC` / `C` / `LD` itself
+  (`CC` meaning "C++ with ccache"), which clobbered the standard variable
+  and polluted what vendor builds (`CC ?= gcc`) and cgo inherit.  Never
+  assign `CC` / `CXX` in the framework.
+- **Debug tools** (`production/tools/gmdbg.py`, dispatched by `tools/gm`).
+  One file, two roles: under python it is the CLI; `gdb -x gmdbg.py` runs the
+  gdb side (config in `$GMDBG_CFG`, report on a private fd so gdb's chatter
+  stays out of the terminal; `_run_gdb` drains the rest and prints it only on
+  failure or `-v`).  It never edits the target and never replaces gdb: `watch`
+  arms `gdb.Breakpoint` hardware watchpoints and refuses a software fallback,
+  `--kernel` is a `catch syscall` whose condition is a gdb convenience function
+  (`$_gm_kw`) that reports from inside the condition and returns 0, so gdb keeps
+  resuming.  Fatal signals are passed to the target.  Classification in
+  `_classify` is plain pattern matching over (signal, frame names, instruction,
+  registers); keep it a pure function.  gdb 8.2 is the floor (no
+  `Inferior.architecture`).  `_find_gdb` probes gdb's Python (importing what the script
+  imports) and, on failure, retries without `LD_LIBRARY_PATH` / `PYTHONHOME` / `PYTHONPATH`,
+  handing them to a launched target via `set environment`.  Nothing here touches the build; `note/memwatch.*`
+  is someone else's older tool and is not part of gm.
+- **Instrumentation axes** (`SANITIZE`, `COVERAGE`).  Axes next to
+  `BUILD_MODE`, not modes (coverage used to be one; it inherited debug's flags
+  and could not be combined or placed on release):
+  `env.mk` parses and validates them and derives `GM_MODE_DIR`; `flags.mk` adds
+  the flags at compile and link; `target.go.mk` feeds them to cgo (+ `-asan`);
+  `target.pkg.mk` tags the RPM release and adds the runtime `Requires:`.
+  `component.h` is generated with the *untagged* release because
+  `GM_GEN_DIR` is shared by all variants.  `coverage.mk` rebuilds with
+  `COVERAGE=1`, runs the exes, then `make test`.  Guide: USER_GUIDE 3.12.
+- **Link and reproducibility** (USER_GUIDE 3.14 / 3.15).  Exes get an
+  `$ORIGIN`-relative RPATH (`_GM_RPATH_LIB`, target.common.mk); packaging
+  repoints it with `elf-rpath.py` (spec `%install`, generated and plain mode
+  alike).  `SOURCE_DATE_EPOCH` is exported by env.mk and consumed by `ar -D`,
+  `jar-normalize.py`, rpmbuild (`clamp_mtime…`, `use_source_date_epoch_as_buildtime`,
+  `%__strip` = `strip-deterministic`) and pkg-build.py.
+- **Debuginfo** (`pkg-debuginfo.spec.inc`).  Every mode compiles with `-g`
+  and links with `--build-id`; the generated spec and plain-mode specs both
+  get `%debug_package`, and `target.pkg.mk` publishes the resulting
+  `<pkg>-debuginfo` RPM next to the package.  Guide: USER_GUIDE 3.13.
 
 ---
 
@@ -470,82 +521,36 @@ mechanisms coexist:
 
 ### 9.1 Explicit cmdline forwarding (dispatcher)
 
-`$(TARGET_ALL)` dispatcher recipe:
+`$(TARGET_ALL)` dispatcher recipe (top-level `Makefile`):
 
 ```make
-$(MAKE) -C $(SOURCE_DIR) -f $@.mk -f $(call TARGET_RULES_FOR,$(TYPE)) \
-    BUILD_DIR='$(BUILD_DIR)' OUT_DIR='$(OUT_DIR)' \
-    SOURCE_DIR='$(SOURCE_DIR)' REL_DIR='$(REL_DIR)' TYPE='$(TYPE)' \
-    $(SUB_TARGET)
+$(MAKE) -C $(SOURCE_DIR) -f env.mk -f $($@_mkfile) -f $(call TARGET_RULES_FOR,$(TYPE)) \
+    $(_GM_CMDLINE) BUILD_DIR='$(BUILD_DIR)' OUT_DIR='$(OUT_DIR)' \
+    SOURCE_DIR='$(SOURCE_DIR)' REL_DIR='$(REL_DIR)' TYPE='$(TYPE)' $(SUB_TARGET)
 ```
 
-- `BUILD_DIR / OUT_DIR / SOURCE_DIR / REL_DIR / TYPE` are passed on
-  the sub-make's cmdline.  These get **cmdline-override** semantics
-  in the sub-make — they beat any `:=` assignment in target.c.mk /
-  target.go.mk / etc.
-- `$(SUB_TARGET)` is the sub-make's goal (empty = default = build the
-  target; `clean` / `check` for other flows — see env.mk's SUB_TARGET
-  whitelist).
+- `_GM_CMDLINE` carries what the top level derived: `PROJ_TOP ADMIN_DIR
+  BUILD_ARCH BUILD_MODE SANITIZE GM_OUT DEP_TREE GM_SYS_LIBS TARGET_ALL
+  TARGET_DEP`.  Anything new that the top level computes and sub-makes must
+  agree on belongs here.
+- These are passed on the sub-make's cmdline, so they get **cmdline-override**
+  semantics: they beat any `:=` assignment in target.c.mk / target.go.mk / ...
+- `$(SUB_TARGET)` is the sub-make's goal (empty = build the target;
+  `clean` otherwise — see env.mk's SUB_TARGET whitelist).
 
-### 9.2 Environment inheritance (env.mk's `export` list)
+### 9.2 MAKEFLAGS and the environment
 
-`env.mk` L246-249:
+- Variables given on the command line (`DRY_RUN=1`, `WARN_LEVEL=...`,
+  `CC=...`) ride in `MAKEFLAGS` into every child make; that is how
+  `DRY_RUN` reaches the leaf without being in `_GM_CMDLINE`
+  (docs/3-DRY_RUN.md).  A makefile assignment never beats a cmdline value.
+- Exported on purpose: `GM_TREE=1` (nesting guard, env.mk) and
+  `SOURCE_DATE_EPOCH`.  Re-entry sites clear the guard with `GM_TREE= $(MAKE) ...`.
 
-```make
-export PROJ_TOP ADMIN_DIR BUILD_ARCH BUILD_MODE DEP_TREE DRY_RUN
-export GM_OUT GM_LIB_DIR GM_EXEC_DIR GM_PKG_DIR GM_JAVA_DIR
-export GM_GEN_DIR GM_COVERAGE_DIR GM_RELEASE_DIR GM_DEP_FILE GM_PKG_OF_FILE
-export GM_FRAMEWORK_CORE_MK
-```
+### 9.3 Validation runs in every make instance
 
-These become **shell env vars** whenever a recipe runs.  When that
-recipe calls `$(MAKE)`, the sub-make imports them as make variables
-with `origin=environment` — lower priority than cmdline, but higher
-than `:=` assignments in the sub-make.
-
-**The DRY_RUN trick that isn't obvious**:
-
-```make
-# project.mk
-deps: DRY_RUN := 1
-deps:
-	@for t in $(TARGET_PKG) ; do $(MAKE) -s $$t ; done
-```
-
-`DRY_RUN := 1` here is a **target-specific variable**.  It's only
-visible during `deps:`'s recipe.  Combined with `export DRY_RUN` in
-env.mk, **target-specific values ARE exported to the recipe's shell
-env** (GNU Make §5.7.2).  So the sub-make spawned by
-`$(MAKE) -s $$t` reads `DRY_RUN=1` from env → target.c.mk's
-`ifeq ($(DRY_RUN),1)` matches → dry-run branch fires.
-
-Verify:
-
-```
-$ DRY_RUN=1 make -f production/make/env.mk -f- <<< '$$(info origin=$$(origin DRY_RUN))'
-origin=environment
-```
-
-**Consequence**: don't add `DRY_RUN :=` (unconditional) anywhere in
-env.mk or target.*.mk.  It would beat the env-inherited value in the
-sub-make and break dry-run derivation.
-
-### 9.3 `MAKELEVEL` gate for validation
-
-The legality-guard block at the top of env.mk (§2.1) is wrapped in:
-
-```make
-ifeq ($(MAKELEVEL),0)
-    ... validation ...
-endif
-```
-
-Rationale: sub-makes ALSO parse env.mk (via target.common.mk), and we
-don't want the deprecation warning about `o=` to fire once per sub-
-make invocation.  MAKELEVEL is a make built-in: 0 at top level, 1 in
-a first-level `$(MAKE)`-launched child, etc.  Top-level Makefile
-validates once; sub-makes trust the (already-validated) values
-forwarded to them via §9.1 / §9.2.
+env.mk's legality guards (§2.1, §14) are cheap and not gated on `MAKELEVEL`:
+every sub-make re-validates the values forwarded via §9.1.
 
 ---
 
@@ -773,21 +778,25 @@ For consistency with `container/` (which vendors `pydep/` and
 
 ## 14. Legality guards — what env.mk refuses
 
-At parse time (top-level only, MAKELEVEL=0):
+At parse time (every make instance, §9.3):
 
 - `SUB_TARGET=<value>` — whitelist `clean` (empty = default).  `check`
   was previously accepted but every per-type implementation had drifted
   from its designed purpose (artefact-diff against a reference build);
   all removed pending a re-implementation.  See env.mk's design note
   next to `SUB_TARGET_VALID`.
-- `BUILD_MODE=<value>` — whitelist `debug release coverage`
+- `BUILD_MODE=<value>` — whitelist `debug release`
   (extend via `GM_VALID_MODES += <name>` in the project Makefile
   BEFORE including env.mk).
+- `SANITIZE=<set>` — comma list of `address undefined thread` (empty =
+  off); unknown entries and `address`+`thread` are refused.  `COVERAGE` —
+  empty / `0` / `no` / `1` / `yes`.  Every output dir, `BUILD_DIR` and
+  `%/$(GM_MODE_DIR)` mkdir rule goes through `GM_MODE_DIR`, so instrumented
+  and plain objects never share a directory (§6.1).
 - `MAKECMDGOALS` mixing `lib*` + `pkg*` — refused (they're different
   DAG tiers; run separately for explicit ordering).  DRY_RUN dispatch
   is exempt (dep-derivation legitimately needs both).
-- `o=<value>` — deprecated alias for `SUB_TARGET=`, emits warning +
-  forwards.
+- `o=<value>` — alias for `SUB_TARGET=`.
 
 Every guard emits an error message that names the invalid value AND
 tells the user how to fix / extend.
@@ -838,6 +847,10 @@ Checks (as of writing):
 6. Actionlint     (`.github/workflows/*.yml`)
 7. Jq syntax      (`production/make/scripts/*.jq`)
 8. gm smoke       (`make list-targets` sees every example target)
+9. nested-gm guard, duplicate basenames, bad LDLIBS, idempotence, compile database
+10. build variants (`SANITIZE` / `COVERAGE` axes, per-mode flags, hardening)
+11. compiler selection (`CC` / `CXX` / `PATH`, ccache shims skipped)
+12. `gm core|watch|symbols` against tiny crash programs (needs gdb + Python; skipped otherwise)
 
 Add a new check = write a `check_<name>` bash function in
 precheck.sh, register in `ALL_CHECKS`.  Nothing else changes.
