@@ -19,8 +19,8 @@
 #
 # Path canonicalisation policy: `realpath -s` (absolute, but symlinks
 # left in place).  Design intent: emit is fast + minimal, and OUT_DIR
-# views (like `build/lib/rhlinux/debug/libt2.so ->
-# build/example/t2/rhlinux/debug/libt2.so`) stay literal in the trace.
+# views (like `build/lib/rhlinux/debug/libtmstats.so ->
+# build/example/stats/rhlinux/debug/libtmstats.so`) stay literal in the trace.
 # Final canonicalisation to real disk paths happens at
 # **aggregation/load time** in `production/tools/pydep/dag.py`, so
 # every consumer of the dep-graph sees the same realpath'd view

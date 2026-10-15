@@ -137,6 +137,16 @@ class PkgFile:
     owner: str
     group: str
     filegroup: str       # original filegroup name (for diagnostics)
+    flags: list[str] = field(default_factory=list)   # config / noreplace / missingok / doc / license
+
+
+@dataclass
+class PkgPath:
+    """A path the package owns without carrying a file (`dirs:` / `ghosts:`)."""
+    path: str
+    mode: str
+    owner: str
+    group: str
 
 
 @dataclass
@@ -175,13 +185,28 @@ class Manifest:
     install_root: str
     component: Component = field(default_factory=Component)
     unresolved_vars: list[str] = field(default_factory=list)
+    license: str = "Proprietary"
+    group: str = "Networking"
+    install_post: list[str] = field(default_factory=list)
+    epoch: str = ""
+    url: str = ""
+    vendor: str = ""
+    packager: str = ""
+    provides: list[str] = field(default_factory=list)
+    conflicts: list[str] = field(default_factory=list)
+    obsoletes: list[str] = field(default_factory=list)
+    requires_scoped: dict[str, list[str]] = field(default_factory=dict)   # pre/post/preun/postun
+    autoreqprov: bool = False
+    scripts: dict[str, str] = field(default_factory=dict)
+    dirs: list[PkgPath] = field(default_factory=list)
+    ghosts: list[PkgPath] = field(default_factory=list)
 
 
 ########################################################################
 # $VAR / ${VAR} substitution
 ########################################################################
 
-_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+_VAR_RE = re.compile(r"\$\$|\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
 
 # Names that always pass through unresolved without a warning.  `schema`
 # is the yaml-language-server LSP directive marker
@@ -198,6 +223,8 @@ def _substitute(text: str, mapping: VarMap, unresolved: list[str]) -> str:
         return text
 
     def _sub(match: re.Match) -> str:
+        if match.group(0) == "$$":      # escape: a literal $ (shell variables in scriptlets)
+            return "$"
         name = match.group(1) or match.group(2)
         if name in mapping:
             return mapping[name]
@@ -226,7 +253,7 @@ def _parse_vars(pairs: list[str]) -> VarMap:
 def _load_pkg_yaml(path: Path, mapping: VarMap, unresolved: list[str]) -> dict[str, Any]:
     """Read pkg.yaml, substitute $VARs in the raw text, parse.
     Substituting on raw text is deliberate: some fields (e.g.
-    `src: $GM_LIB_DIR/libt2.so`) reference the same placeholders used
+    `src: $GM_LIB_DIR/libtmstats.so`) reference the same placeholders used
     across the tree; single-pass substitution keeps the semantics
     uniform whether the value shows up as a string, a key, or inside
     a long-form multiline scalar."""
@@ -282,7 +309,16 @@ def _resolve_pkg_file(
         owner=overrides.get("owner") or fg["owner"],
         group=overrides.get("group") or fg["group"],
         filegroup=filegroup_name,
+        flags=list(overrides.get("flags", [])),
     )
+
+
+def _path_entry(entry: str | dict[str, Any], mode: str) -> PkgPath:
+    """`dirs:` / `ghosts:` entry (string or object) -> PkgPath."""
+    if isinstance(entry, str):
+        return PkgPath(entry, mode, "root", "root")
+    return PkgPath(entry["path"], entry.get("mode") or mode,
+                   entry.get("owner") or "root", entry.get("group") or "root")
 
 
 def _build_manifest(cfg: dict[str, Any], args: argparse.Namespace,
@@ -315,9 +351,24 @@ def _build_manifest(cfg: dict[str, Any], args: argparse.Namespace,
         version=version,
         release=args.release,
         description=cfg["description"],
+        license=cfg["license"],
+        group=cfg["group"],
+        install_post=list(args.install_post),
+        epoch=cfg["epoch"],
+        url=cfg["url"],
+        vendor=cfg["vendor"],
+        packager=cfg["packager"],
+        provides=list(cfg["provides"]),
+        conflicts=list(cfg["conflicts"]),
+        obsoletes=list(cfg["obsoletes"]),
+        requires_scoped={k: list(cfg[f"requires_{k}"]) for k in ("pre", "post", "preun", "postun")},
+        autoreqprov=cfg["autoreqprov"],
+        scripts={k: v for k, v in cfg["scripts"].items() if v.strip()},
+        dirs=[_path_entry(e, "0755") for e in cfg["dirs"]],
+        ghosts=[_path_entry(e, "0644") for e in cfg["ghosts"]],
         pkg_type=cfg["pkg_type"],
         components=[component.name] if component.name else [],
-        rpm_deps=sorted(set(cfg["rpm_deps"])),
+        rpm_deps=sorted(set(cfg["rpm_deps"]) | set(args.rpm_dep)),
         files=files,
         install_root=install_root,
         component=component,
@@ -340,22 +391,25 @@ def _build_alarms(cfg: dict[str, Any]) -> list[Alarm]:
 # %build here would run inside rpmbuild's private shell and escape our
 # instrumentation entirely.  Only %install (staging into buildroot) and
 # %files (payload manifest) are emitted.
+# Also injected into plain-mode specs by target.pkg.mk.
+DEBUGINFO_BLOCK = (Path(__file__).resolve().parent / "pkg-debuginfo.spec.inc").read_text(encoding="utf-8")
+
 SPEC_TEMPLATE = """\
 Summary:        {summary}
 Name:           {name}
 Version:        {version}
 Release:        {release}%{{?dist}}
-License:        Proprietary
-Group:          Networking
+License:        {license}
+Group:          {group}
 BuildArch:      {arch}
-AutoReqProv:    no
+AutoReqProv:    {autoreqprov}
 Prefix:         {install_root}
-{requires_lines}\
+{header_tags}\
 
 %description
 {description_body}
 
-%global __strip /bin/true
+{debuginfo_block}
 
 # Auto-generated -- do NOT hand-edit.  make owns build; this spec only
 # stages already-built artefacts into the buildroot and lists them.
@@ -366,19 +420,47 @@ Prefix:         {install_root}
 %files
 %defattr(-,bin,bin)
 {files_body}
-
-%pre
-
-%post
-
-%preun
-
-%postun
-
+{scripts_body}
 %changelog
 * {changelog_date} pkg-build auto-generated - {version}-{release}
 - Generated from pkg.yaml
 """
+
+# Scriptlet sections, in rpm's execution order.
+_SCRIPTLETS = ("pretrans", "pre", "post", "preun", "postun", "posttrans")
+
+
+def _header_tags(m: Manifest) -> str:
+    """Optional RPM tags (Epoch / URL / Vendor / Packager / Requires / Provides / ...)."""
+    lines: list[str] = []
+    for tag, val in (("Epoch", m.epoch), ("URL", m.url), ("Vendor", m.vendor), ("Packager", m.packager)):
+        if val:
+            lines.append(f"{tag}:{' ' * (15 - len(tag))}{val}")
+    lines += [f"Requires:       {d}" for d in m.rpm_deps]
+    for scope in ("pre", "post", "preun", "postun"):
+        lines += [f"Requires({scope}): {d}" for d in m.requires_scoped.get(scope, [])]
+    for tag, vals in (("Provides", m.provides), ("Conflicts", m.conflicts), ("Obsoletes", m.obsoletes)):
+        lines += [f"{tag}:{' ' * (15 - len(tag))}{v}" for v in vals]
+    return "".join(f"{ln}\n" for ln in lines)
+
+
+def _files_line(f: PkgFile) -> str:
+    """One %files line: directives (%config(noreplace) %doc ...) + %attr + path."""
+    cfg_attrs = [x for x in ("noreplace", "missingok") if x in f.flags]
+    parts: list[str] = []
+    if "config" in f.flags or cfg_attrs:
+        parts.append("%config" + (f"({','.join(cfg_attrs)})" if cfg_attrs else ""))
+    parts += [f"%{d}" for d in ("doc", "license") if d in f.flags]
+    parts.append(f"%attr({f.mode},{f.owner},{f.group}) {f.dest}")
+    return " ".join(parts)
+
+
+def _build_time() -> datetime:
+    """SOURCE_DATE_EPOCH when set (reproducible builds), else now."""
+    epoch = os.environ.get("SOURCE_DATE_EPOCH", "").strip()
+    if epoch.isdigit():
+        return datetime.fromtimestamp(int(epoch), tz=timezone.utc)
+    return datetime.now(timezone.utc)
 
 
 def _render_spec(m: Manifest, arch: str) -> str:
@@ -388,8 +470,6 @@ def _render_spec(m: Manifest, arch: str) -> str:
     `+ install /abs/src /buildroot/dst` lines to recover deps, so
     hiding sources behind %{_sourcedir}/<basename> would break the
     log-based capture."""
-    requires_lines = "".join(f"Requires:       {d}\n" for d in m.rpm_deps)
-
     # Legacy '!!!' prefix that some upstream .spec templates carried; strip.
     body = m.description or f"RPM package {m.pkg}"
     body_lines = [ln.lstrip("!") for ln in body.splitlines()] or [body]
@@ -398,28 +478,47 @@ def _render_spec(m: Manifest, arch: str) -> str:
     install_lines: list[str] = ["set -x"]
     for d in dest_dirs:
         install_lines.append(f"mkdir -p %{{buildroot}}{d}")
+    for owned in m.dirs:
+        install_lines.append(f"mkdir -p %{{buildroot}}{owned.path}")
+    # A %ghost entry must exist in the buildroot: for a missing file rpm records an error text
+    # holding the buildroot path as the file class, which would make the rpm path-dependent.
+    for ghost in m.ghosts:
+        install_lines.append(f"mkdir -p %{{buildroot}}{os.path.dirname(ghost.path)}")
+        install_lines.append(f": > %{{buildroot}}{ghost.path}")
     for f in m.files:
         install_lines.append(
             f"install -m {f.mode} {f.src} %{{buildroot}}{f.dest}"
         )
+    # %attr sets payload modes; buildroot copies must stay writable for strip / objcopy.
+    install_lines.append("chmod -R u+w %{buildroot}")
+    install_lines.extend(m.install_post)
 
-    files_lines = [
-        f"%attr({f.mode},{f.owner},{f.group}) {f.dest}"
-        for f in m.files
-    ]
+    files_lines = [_files_line(f) for f in m.files]
+    files_lines += [f"%dir %attr({d.mode},{d.owner},{d.group}) {d.path}" for d in m.dirs]
+    files_lines += [f"%ghost %attr({g.mode},{g.owner},{g.group}) {g.path}" for g in m.ghosts]
+    # pre / post / preun / postun were always emitted (empty when unused): keep that, so packages
+    # that declare no scripts stay byte-identical; pretrans / posttrans only when asked for.
+    scripts_body = "".join(
+        f"\n%{name}\n{m.scripts.get(name, '').rstrip()}\n"
+        for name in _SCRIPTLETS if name in m.scripts or name in ("pre", "post", "preun", "postun"))
 
     return SPEC_TEMPLATE.format(
         summary=m.description or f"RPM package {m.pkg}",
+        license=m.license,
+        group=m.group,
         name=m.pkg,
         version=m.version,
         release=m.release,
         arch=arch,
         install_root=m.install_root,
-        requires_lines=requires_lines,
+        autoreqprov="yes" if m.autoreqprov else "no",
+        header_tags=_header_tags(m),
+        debuginfo_block=DEBUGINFO_BLOCK.rstrip("\n"),
         description_body="\n".join(body_lines),
         install_body="\n".join(install_lines),
         files_body="\n".join(files_lines),
-        changelog_date=datetime.now(timezone.utc).strftime("%a %b %d %Y"),
+        scripts_body=scripts_body,
+        changelog_date=_build_time().strftime("%a %b %d %Y"),
     )
 
 
@@ -429,12 +528,12 @@ def _render_spec(m: Manifest, arch: str) -> str:
 
 def _c_ident(name: str) -> str:
     """Turn any string into a valid C identifier (upper-case).
-    `pkg-p2` -> `PKG_P2`."""
+    `pkg-tmd` -> `PKG_TMD`."""
     return re.sub(r"[^A-Za-z0-9_]", "_", name).upper()
 
 
 def _alarm_ns(pkg: str) -> str:
-    """C++ namespace for a pkg's alarms.  `pkg-p2` -> `gm_alarms_pkg_p2`."""
+    """C++ namespace for a pkg's alarms.  `pkg-tmd` -> `gm_alarms_pkg_tmd`."""
     return f"gm_alarms_{_c_ident(pkg).lower()}"
 
 
@@ -457,7 +556,7 @@ def _render_alarms_header(alarms: list[Alarm], pkg: str, component: Component) -
     lines.append("/*")
     lines.append(" * Auto-generated by pkg-build.py --alarms-out -- DO NOT EDIT.")
     lines.append(f" * Source: alarms[] of {component.name or pkg}'s pkg.yaml.")
-    lines.append(f" * Emitted: {datetime.now(timezone.utc).isoformat(timespec='seconds')}")
+    lines.append(f" * Emitted: {_build_time().isoformat(timespec='seconds')}")
     lines.append(" */")
     lines.append("#pragma once")
     lines.append("")
@@ -506,7 +605,7 @@ def _render_alarms_cxx(alarms: list[Alarm], pkg: str, component: Component,
     lines.append("/*")
     lines.append(" * Auto-generated by pkg-build.py --alarms-out -- DO NOT EDIT.")
     lines.append(f" * Source: alarms[] of {component.name or pkg}'s pkg.yaml.")
-    lines.append(f" * Emitted: {datetime.now(timezone.utc).isoformat(timespec='seconds')}")
+    lines.append(f" * Emitted: {_build_time().isoformat(timespec='seconds')}")
     lines.append(" */")
     lines.append("")
     lines.append(f'#include "{header_include}"')
@@ -578,7 +677,8 @@ def _pkg_prefix(pkg_name: str) -> str:
     """Derive the macro prefix used for this pkg's component.h.
 
     Convention: last dot-or-hyphen segment of the pkg name, uppercased.
-      pkg-p2                       -> P2
+      pkg-tmd                      -> TMD
+      pkg-tm-devel                 -> DEVEL
       pkg-alpha                    -> ALPHA
       group-name                   -> NAME
       Component.HssServer.pcgw     -> PCGW"""
@@ -588,14 +688,14 @@ def _pkg_prefix(pkg_name: str) -> str:
 
 def _render_component_header(m: Manifest) -> str:
     """component.h: compile-time metadata (name, id, version) as
-    prefixed #defines.  Consumers `#include <pkg-p2/component.h>` +
-    reference P2_PKG_VERSION / P2_NAME / etc.
+    prefixed #defines.  Consumers `#include <pkg-tmd/component.h>` +
+    reference TMD_PKG_VERSION / TMD_NAME / etc.
 
     No unprefixed aliases -- would silently collide when a second pkg
     starts sharing the same lib.  Multi-pkg consumers reference
-    `P1_NAME` alongside `P2_NAME` without any ambiguity.
+    `TMD_NAME` alongside `DEVEL_NAME` without any ambiguity.
 
-    The `pkg-xml prefix: <PREFIX>` marker line is load-bearing:
+    The `pkg-xml prefix: <PREFIX>` marker line (the script's historical name) is load-bearing:
     make-versionstamp.sh grep's it out to discover the prefix without
     re-parsing the yaml.  Do NOT rename it without updating that script."""
     prefix = _pkg_prefix(m.pkg)
@@ -608,7 +708,7 @@ def _render_component_header(m: Manifest) -> str:
     lines.append("/*")
     lines.append(" * Auto-generated by pkg-build.py -- do NOT hand-edit.")
     lines.append(f" * pkg-build source: {m.pkg}")
-    lines.append(f" * Emitted: {datetime.now(timezone.utc).isoformat(timespec='seconds')}")
+    lines.append(f" * Emitted: {_build_time().isoformat(timespec='seconds')}")
     lines.append(" */")
     lines.append("")
     lines.append(f"#ifndef COMPONENT_H_{prefix}_INCLUDED")
@@ -691,6 +791,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
                    help="override package version (default: `major`.`minor` from pkg.yaml)")
     p.add_argument("--release", default="1",
                    help="package release (default: 1)")
+    p.add_argument("--rpm-dep", action="append", default=[], metavar="NAME",
+                   help="extra `Requires:` merged with pkg.yaml's rpm_deps "
+                        "(build-system injected, e.g. libasan for ASan RPMs). Repeatable.")
+    p.add_argument("--install-post", action="append", default=[], metavar="CMD",
+                   help="shell line appended to %%install after staging (build-system injected). Repeatable.")
     p.add_argument("--arch", default=None,
                    help="target arch for the spec's BuildArch: (default: `uname -m`)")
     p.add_argument("--manifest-out", help="manifest.json output path")
@@ -827,7 +932,13 @@ def _manifest_to_dict(m: Manifest) -> dict[str, Any]:
         "install_root":   m.install_root,
         "files":          [{"src": f.src, "dest": f.dest, "mode": f.mode,
                             "owner": f.owner, "group": f.group,
-                            "filegroup": f.filegroup} for f in m.files],
+                            "filegroup": f.filegroup, "flags": f.flags} for f in m.files],
+        "dirs":           [d.path for d in m.dirs],
+        "ghosts":         [g.path for g in m.ghosts],
+        "provides":       m.provides,
+        "conflicts":      m.conflicts,
+        "obsoletes":      m.obsoletes,
+        "scripts":        sorted(m.scripts),
         "component": {
             "name":          m.component.name,
             "major_version": m.component.major_version,

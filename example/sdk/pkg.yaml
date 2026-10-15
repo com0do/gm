@@ -1,0 +1,26 @@
+# yaml-language-server: $schema=../../production/make/schemas/pkg.schema.yaml
+#
+# pkg-tm-devel -- headers and libraries for building against the telemetry libraries.
+
+pkg:         pkg-tm-devel
+description: telemetry SDK -- tm/core.h, tm/stats.hpp, libtmcore.a, libtmstats.so
+license:     MIT
+pkg_type:    sublibrary
+rpm_deps:    [pkg-tmd]
+
+component:
+  name:          gm/example/tm-devel
+  id:            '000.004.002.000.000.000'
+  major_version: '1'
+  minor_version: '4'
+  comp_type:     library
+
+# Headers and Static_Libraries come from filegroup_map.json; Impl_Libraries64 is the schema's.
+files:
+  Headers:
+    - $PROJ_TOP/example/core/include/tm/core.h
+    - $PROJ_TOP/example/stats/include/tm/stats.hpp
+  Static_Libraries:
+    - $GM_LIB_DIR/libtmcore.a
+  Impl_Libraries64:
+    - $GM_LIB_DIR/libtmstats.so

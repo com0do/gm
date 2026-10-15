@@ -71,11 +71,13 @@ runs:
             - 'production/make/**'
             - 'production/tools/**'
             - 'example/**'
+            - 'third_party/**'
             - 'do_build.sh'
-          # Test targets live at example/*/test/**; gtest itself is
+          # Test targets live at example/*/test/** and example/selftest/; gtest itself is
           # vendored under production/tools/gtest-*.
           tests:
             - 'example/**/test/**'
+            - 'example/selftest/**'
             - 'production/tools/gtest-*/**'
             - 'production/test/**'
           # Container: everything under container/, plus the shared

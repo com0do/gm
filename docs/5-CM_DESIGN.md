@@ -66,9 +66,9 @@ layout:
 customization/                    # authored + released at layer 3
 ├── yang/
 │   ├── common/gm-common.yang     # shared groupings + typedefs
-│   └── pkg-p2/pkg-p2.yang        # pkg-p2's config schema
+│   └── pkg-tmd/pkg-tmd.yang      # pkg-tmd's config schema
 ├── generic/generic.yaml          # master defaults for the WHOLE product
-├── templates/pkg-p2.template.yaml  # cmproxy → generic slice mapping
+├── templates/pkg-tmd.template.yaml  # cmproxy → generic slice mapping
 └── tools/validate.sh             # standalone, pyang-based, no gm
 ```
 
@@ -84,7 +84,7 @@ store.
    binary changes on every code push; its config schema changes
    maybe once a quarter.  Baking YANG into the rpm couples two very
    different release cadences.
-2. **One product config, one truth.**  If pkg-p1 and pkg-p2 both
+2. **One product config, one truth.**  If pkg-tmd and another pkg both
    reference a shared value (say NTP servers), that value has to live
    in one place -- not duplicated across two rpms.  A central
    `generic.yaml` is the natural home.  Per-rpm YANG would force
@@ -101,15 +101,15 @@ Whatever gm cares about a pkg -- name, version, files, alarms,
 rpm-level `Requires:` -- is authored in `pkg.yaml` and nowhere else.
 There is no auto-inference from other trees:
 
-- If pkg-p2 needs pkg-p1 installed to run (e.g. bundles a lib that
-  dynamically loads a symbol from pkg-p1), the author declares
-  `rpm_deps: [pkg-p1]` in `pkg.yaml`.  That is the truth.  gm
+- If pkg-tm-devel needs pkg-tmd installed to be useful (an SDK for the daemon's
+  libraries), the author declares `rpm_deps: [pkg-tmd]` in `pkg.yaml`
+  (example/sdk/pkg.yaml).  That is the truth.  gm
   doesn't second-guess it, and doesn't try to derive it from the
   transitive lib graph.
-- If pkg-p2 needs a config knob at runtime, that knob is declared
-  in `customization/yang/pkg-p2/pkg-p2.yang` (layer 3), given a
+- If pkg-tmd needs a config knob at runtime, that knob is declared
+  in `customization/yang/pkg-tmd/pkg-tmd.yang` (layer 3), given a
   default in `customization/generic/generic.yaml`, and exposed
-  through `customization/templates/pkg-p2.template.yaml`.  None of
+  through `customization/templates/pkg-tmd.template.yaml`.  None of
   that appears in `pkg.yaml`.  The runtime side (cmproxy) glues them.
 
 `pkg.yaml` describes the **package**.  `customization/` describes

@@ -53,12 +53,12 @@ customization/
 ├── yang/
 │   ├── common/
 │   │   └── gm-common.yang           # shared groupings + typedefs
-│   └── pkg-p2/
-│       └── pkg-p2.yang              # pkg-p2's config schema
+│   └── pkg-tmd/
+│       └── pkg-tmd.yang             # pkg-tmd's config schema
 ├── generic/
 │   └── generic.yaml                 # master defaults for the product
 ├── templates/
-│   └── pkg-p2.template.yaml         # cmproxy → generic.yaml mapping
+│   └── pkg-tmd.template.yaml        # cmproxy → generic.yaml mapping
 └── tools/
     └── validate.sh                  # yang + generic self-check
 ```
@@ -66,10 +66,10 @@ customization/
 ## What every pkg does at runtime
 
 ```c
-// pkg-p2's process, at start:
-gm_cmproxy_handle *h = gm_cmproxy_open("pkg-p2");   // reads /etc/cmproxy/pkg-p2.template.yaml
-const char *url = gm_cmproxy_get(h, "/pkg-p2:config/backend-url");
-uint32_t     ms = gm_cmproxy_get_u32(h, "/pkg-p2:config/timeout-ms");
+// tmd's process (pkg-tmd, gm's example product), at start:
+gm_cmproxy_handle *h = gm_cmproxy_open("pkg-tmd");   // reads /etc/cmproxy/pkg-tmd.template.yaml
+uint32_t window = gm_cmproxy_get_u32(h, "/pkg-tmd:config/window");
+uint32_t every  = gm_cmproxy_get_u32(h, "/pkg-tmd:config/report-every");
 ```
 
 The pkg author doesn't ship yang or defaults inside the rpm.  They
@@ -100,7 +100,7 @@ cd customization
 ./tools/validate.sh
 # outputs:
 #   pyang parse:  yang/common/gm-common.yang ✓
-#   pyang parse:  yang/pkg-p2/pkg-p2.yang ✓
+#   pyang parse:  yang/pkg-tmd/pkg-tmd.yang ✓
 #   generic.yaml check: all N leaves resolve against the yang union ✓
 ```
 

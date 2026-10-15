@@ -8,8 +8,7 @@
 #     pip install -r production/requirements.txt
 #
 # ---- runtime ----------------------------------------------------------
-# YAML loading -- pkg.yaml (target.pkg.mk YAML mode), image manifests,
-# pydep's pkg.yaml -> lib bridge.
+# YAML loading -- pkg.yaml (target.pkg.mk YAML mode), image manifests.
 PyYAML>=6.0,<7
 
 # Draft 2020-12 schema validation for pkg.yaml.
@@ -33,3 +32,6 @@ diff-cover>=8.0,<10
 # guideline applies to reference-build tooling, not our lint chain).
 ruff>=0.6,<1
 mypy>=1.10,<2
+# PyYAML ships no type information: without the stubs mypy reports every `import yaml`, despite
+# ignore_missing_imports (production/mypy/mypy.ini).
+types-PyYAML>=6,<7

@@ -19,10 +19,16 @@ class Kind:
     PKG       = "pkg"
     IMG       = "img"
     JAVA      = "java"
+    # A source or header gm generates (component.h, alarms.cxx): it carries the edge from its
+    # inputs (pkg.yaml) to what compiles it, and is not a build target of its own.
+    GEN       = "gen"
     # Synthetic tier for the gm framework manifest (`gm.dep.json`,
     # emitted by env.mk).  Not a build artefact -- carries the
     # framework-file list that dag.py uses for the escape rule.
     FRAMEWORK = "framework"
+
+
+_GEN_SUFFIXES = (".h", ".hh", ".hpp", ".hxx", ".c", ".cc", ".cpp", ".cxx")
 
 
 def classify(artifact: str) -> str:
@@ -38,6 +44,8 @@ def classify(artifact: str) -> str:
         return Kind.OBJ
     if name.endswith(".jar"):
         return Kind.JAVA
+    if name.endswith(_GEN_SUFFIXES):
+        return Kind.GEN
     return Kind.EXE
 
 
@@ -50,7 +58,7 @@ def target_name(artifact: str, kind: str | None = None) -> str:
         bar (no suffix)                -> `bar`
         pkg-foo-1.0-1.el8.x86_64.rpm   -> `pkg-foo`
         img-foo.id                     -> `img-foo` (from container)
-        obj path                       -> "" (not a build target)
+        obj / generated source path    -> "" (not a build target)
     """
     kind = kind or classify(artifact)
     stem = Path(artifact).name

@@ -14,18 +14,21 @@ else
 _TESTS_TO_RUN := $(TARGET_TEST)
 endif
 
-_RUN_TARGETS := $(_TESTS_TO_RUN:%=run/%)
+_TEST_RUNS := $(_TESTS_TO_RUN:%=run/%)
 
-.PHONY: test test-list $(_RUN_TARGETS)
+.PHONY: test test-list $(_TEST_RUNS)
 
 
-$(_RUN_TARGETS): run/%: %
+# Seconds one test may run before it is killed (a hung test would block CI); 0 = no limit.
+TEST_TIMEOUT ?= 600
+
+$(_TEST_RUNS): run/%: %
 	@$(ECHO)
 	$(V_TEST)
-	@"$(GM_EXEC_DIR)/$*" $(TEST_ARGS)
+	@timeout $(TEST_TIMEOUT) "$(GM_EXEC_DIR)/$*" $(TEST_ARGS)
 
 
-test: $(_RUN_TARGETS)
+test: $(_TEST_RUNS)
 	@ if [ -z "$(_TESTS_TO_RUN)" ]; then \
 	    echo "make test: no test targets $(if $(TESTS),match TESTS='$(TESTS)',discovered)." ; \
 	  else \

@@ -23,6 +23,9 @@ GM_FRAMEWORK_MK := $(GM_FRAMEWORK_CORE_MK) \
     $(CURRENT_FILE) \
     $(ADMIN_DIR)/make/scripts/pkgdeps.py \
     $(ADMIN_DIR)/make/scripts/pkg-build.py \
+    $(ADMIN_DIR)/make/scripts/pkg-debuginfo.spec.inc \
+    $(ADMIN_DIR)/make/scripts/elf-rpath.py \
+    $(ADMIN_DIR)/make/scripts/strip-deterministic \
     $(ADMIN_DIR)/make/schemas/pkg.schema.yaml \
     $(ADMIN_DIR)/tools/dep-hooks.sh
 
@@ -41,6 +44,15 @@ PKG_YAML          ?=
 PKG_YAML_VARS     ?=
 PKG_INSTALL_ROOT  ?=
 PKG_FILEGROUP_MAP ?=
+
+# Sanitizer RPMs: release tag + Requires of the runtime (USER_GUIDE 3.12).
+# component.h keeps the plain release: $(GM_GEN_DIR) is shared by all variants.
+_PKG_RELEASE_BASE := $(PKG_RELEASE)
+ifneq ($(strip $(_VAR_TAGS)),)
+PKG_RELEASE       := $(PKG_RELEASE).$(subst $(_space),.,$(sort $(_VAR_TAGS)))
+PKG_RPM_DEPS      += $(foreach s,$(_SAN_LIST),$(_SAN_RPM_$(s)))
+_PKG_SAN_DEP_ARGS := $(foreach s,$(_SAN_LIST),--rpm-dep $(_SAN_RPM_$(s)))
+endif
 
 # Resolve child-.mk relative paths (MAKEFILE_DIR unset there yet).
 _abs              = $(if $(filter /%,$(1)),$(1),$(MAKEFILE_DIR)/$(1))
@@ -61,25 +73,34 @@ _PKG_VARS_ALL := $(_PKG_AUTO_VARS) $(PKG_YAML_VARS)
 _PKG_INSTALL_ROOT_ARG := $(if $(PKG_INSTALL_ROOT),--install-root $(PKG_INSTALL_ROOT))
 
 
-# _YAML_INTREE: artefact basenames pkg-build.py derived from pkg.yaml `files`.
+# _YAML_INTREE: artefact basenames pkg-build.py derives from pkg.yaml `files`.  Cached (_CACHE,
+# env.mk): python costs more than the rest of a no-op build of this pkg, and of every lib that
+# only needs its component.h.
 ifneq ($(PKG_YAML_ABS),)
-_PYDEP_ERR := $(shell python3 -c 'import importlib.util as u,sys; \
-    sys.exit(0 if u.find_spec("yaml") and u.find_spec("jsonschema") else 1)' \
-    >/dev/null 2>&1 || echo missing)
-ifneq ($(_PYDEP_ERR),)
-$(error pkg $(TARGET) needs PyYAML + jsonschema.  \
-Install:  python3 -m pip install -r $(GM_PYDEP_REQS))
-endif
-_YAML_INTREE := $(shell python3 $(ADMIN_DIR)/make/scripts/pkg-build.py \
-    --pkg $(PKG_YAML_ABS) \
-    $(foreach kv,$(_PKG_VARS_ALL),--vars $(kv)) \
-    $(_PKG_INSTALL_ROOT_ARG) \
-    --print-intree-targets $(RPM_LIB_DIR),$(RPM_EXEC_DIR))
+_YAML_INTREE_KEY  := --pkg $(PKG_YAML_ABS) $(foreach kv,$(_PKG_VARS_ALL),--vars $(kv)) \
+    $(_PKG_INSTALL_ROOT_ARG) --print-intree-targets $(RPM_LIB_DIR),$(RPM_EXEC_DIR)
+_YAML_INTREE_DEPS := $(PKG_YAML_ABS) $(ADMIN_DIR)/make/scripts/pkg-build.py
+_PKG_PYDEPS_OK    := python3 -c 'import importlib.util as u,sys; sys.exit(0 if u.find_spec("yaml") and u.find_spec("jsonschema") else 1)'
+_PKG_PYDEPS_HINT  := gm: pkg $(TARGET) needs PyYAML + jsonschema.  Install:  make prereq  (python3 -m pip install -r $(GM_PYDEP_REQS))
+_YAML_INTREE_CMD   = $(_PKG_PYDEPS_OK) || { $(ECHO) "$(_PKG_PYDEPS_HINT)" >&2 ; exit 1 ; } ; \
+    python3 $(ADMIN_DIR)/make/scripts/pkg-build.py $(_YAML_INTREE_KEY)
+$(eval $(call _CACHE,_YAML_INTREE,$(BUILD_DIR)/.$(TARGET).intree.mk))
 else
 _YAML_INTREE :=
 endif
 
 ifeq ($(DRY_RUN),1)
+# A failed cache rebuild leaves _YAML_INTREE empty and make carries on (the cache is -include'd):
+# the scan would record a pkg that ships nothing, and builds would package files before they
+# exist.  Stop the scan instead.  Only when the cache is not current: then python runs anyway.
+ifneq ($(PKG_YAML_ABS),)
+ifneq ($(strip $(_YAML_INTREE_FOR)),$(strip $(_YAML_INTREE_KEY)))
+ifeq ($(shell $(_PKG_PYDEPS_OK) 2>/dev/null && echo ok),)
+$(error $(_PKG_PYDEPS_HINT))
+endif
+endif
+endif
+
 _YAML_INTREE_DIRECT   := $(filter     $(TARGET_ALL),$(_YAML_INTREE))
 _YAML_INTREE_INDIRECT := $(filter-out $(TARGET_ALL),$(_YAML_INTREE))
 _YAML_INTREE_MISSING  := $(strip $(foreach n,$(_YAML_INTREE_INDIRECT),\
@@ -106,22 +127,45 @@ else
 PKG_SPEC_ABS         := $(call _abs,$(PKG_SPEC))
 PKG_EXTRA_FILES_ABS  := $(foreach f,$(PKG_EXTRA_FILES),$(call _abs,$(f)))
 
-RPM_TARGET_ARCH   ?= $(shell uname -m)
+RPM_TARGET_ARCH   ?= $(_GM_UNAME_M)
 PKG_SPEC_VARS     ?=
 PKG_SPEC_VARS     += PKG_VERSION PKG_RELEASE TARGET BUILD_ARCH BUILD_MODE RPM_TARGET_ARCH PKG_RPM_DEPS_REQ
-PKG_RPM_DEPS_REQ := $(if $(strip $(PKG_RPM_DEPS)),$(shell echo "$(PKG_RPM_DEPS)" | tr -s ' ' ',' | sed 's/^,//;s/,$$//'))
+_COMMA := ,
+_SPACE := $(subst ,, )
+PKG_RPM_DEPS_REQ := $(subst $(_SPACE),$(_COMMA),$(strip $(PKG_RPM_DEPS)))
 
 RPMBUILD_DIR  := $(BUILD_DIR)/rpmbuild
 SOURCES_DIR   := $(RPMBUILD_DIR)/SOURCES
 BUILDROOT_DIR := $(RPMBUILD_DIR)/BUILDROOT
 SPECS_DIR     := $(RPMBUILD_DIR)/SPECS
 
-# %{?dist} (e.g. ".el8") is auto-appended when the spec references it;
-# ask rpm so the filename we expect matches what rpmbuild produces.
-PKG_DIST_TAG  := $(shell rpm --eval '%{?dist}' 2>/dev/null)
+# %{?dist} (e.g. ".el8") is auto-appended when the spec references it; rpm is asked once per
+# tree (project.mk) so the filename we expect matches what rpmbuild produces.
+PKG_DIST_TAG  := $(_GM_RPM_DIST)
 GEN_SPEC      := $(SPECS_DIR)/$(TARGET).spec
 PKG_FILENAME  := $(TARGET)-$(PKG_VERSION)-$(PKG_RELEASE)$(PKG_DIST_TAG).$(RPM_TARGET_ARCH).rpm
 PKG_OUT       := $(OUT_DIR)/$(PKG_FILENAME)
+# rpmbuild also emits <name>-debuginfo (pkg-debuginfo.spec.inc); published next to the main RPM.
+PKG_DBG_FILENAME := $(TARGET)-debuginfo-$(PKG_VERSION)-$(PKG_RELEASE)$(PKG_DIST_TAG).$(RPM_TARGET_ARCH).rpm
+PKG_DBG_OUT   := $(OUT_DIR)/$(PKG_DBG_FILENAME)
+PKG_DEBUGINFO_INC := $(ADMIN_DIR)/make/scripts/pkg-debuginfo.spec.inc
+# Packaged exes carry the build tree's relative RPATH: repoint it at the libs in the RPM.
+_PKG_RPATH_FIX := python3 $(ADMIN_DIR)/make/scripts/elf-rpath.py --buildroot %{buildroot} --marker $(patsubst $(GM_OUT)/%,%,$(GM_LIB_DIR)) --marker $(GM_OUT)
+# One rpmbuild invocation for both modes.  On failure the log tail is shown: the log alone
+# (a path in a build tree) is what used to cost a CI round trip.
+_RPMBUILD_DEFS = --define '_topdir $(RPMBUILD_DIR)' \
+	          --define '_specdir $(SPECS_DIR)' \
+	          --define '_builddir $(RPMBUILD_DIR)/BUILD' \
+	          --define '_rpmdir $(RPMBUILD_DIR)/RPMS' \
+	          --define '_srcrpmdir $(RPMBUILD_DIR)/SRPMS' \
+	          --define '_buildrootdir $(BUILDROOT_DIR)' \
+	          --define 'clamp_mtime_to_source_date_epoch 1' \
+	          --define 'use_source_date_epoch_as_buildtime 1' \
+	          --define '_buildhost $(BUILD_HOST)' \
+	          --define '__strip $(ADMIN_DIR)/make/scripts/strip-deterministic'
+_RPMBUILD = $(RPMBUILD) $(_RPMBUILD_DEFS) $(1) --target $(RPM_TARGET_ARCH) -bb $(GEN_SPEC) >>$(PKG_BUILD_LOG) 2>&1 \
+	    || { echo "pkg $(TARGET): rpmbuild failed, last lines of $(PKG_BUILD_LOG):" >&2 ; \
+	         tail -n 30 $(PKG_BUILD_LOG) >&2 ; exit 1 ; }
 PKG_HOOKS_LOG := $(BUILD_DIR)/$(TARGET).hooks.jsonl
 PKG_BUILD_LOG := $(BUILD_DIR)/$(TARGET)_rpmbuild.log
 PKG_DEP_JSON  := $(OUT_DIR)/$(TARGET).dep.json
@@ -131,18 +175,22 @@ PKG_COMPONENT_DIR := $(dir $(PKG_COMPONENT_HDR))
 
 
 ifneq ($(MAKECMDGOALS),clean)
-_pkg_resolve = $(firstword $(wildcard \
-                   $(RPM_EXEC_DIR)/$(1) \
-                   $(RPM_LIB_DIR)/$(1).so \
-                   $(RPM_LIB_DIR)/$(1).a))
-_PKG_UNRESOLVED := $(strip $(foreach f,$(PKG_FILES),\
-    $(if $(strip $(call _pkg_resolve,$(f))),,$(f))))
+_pkg_found  = $(firstword $(wildcard \
+                  $(RPM_EXEC_DIR)/$(1) \
+                  $(RPM_LIB_DIR)/$(1).so \
+                  $(RPM_LIB_DIR)/$(1).a))
+_pkg_expect = $(if $(filter lib%,$(1)),$(RPM_LIB_DIR)/$(1).so,$(RPM_EXEC_DIR)/$(1))
+_pkg_resolve = $(or $(call _pkg_found,$(1)),$(if $(_GM_MAKE_N),$(call _pkg_expect,$(1))))
+_PKG_UNRESOLVED := $(strip $(foreach f,$(PKG_FILES),$(if $(strip $(call _pkg_resolve,$(f))),,$(f))))
 ifneq ($(_PKG_UNRESOLVED),)
 $(error pkg $(TARGET): PKG_FILES entries not found under $(RPM_EXEC_DIR) or $(RPM_LIB_DIR): $(_PKG_UNRESOLVED). )
 endif
 
-_PKG_STAGE_FILES := $(foreach f,$(PKG_FILES),$(call _pkg_resolve,$(f))) \
-                    $(PKG_EXTRA_FILES_ABS)
+_PKG_ARTEFACTS   := $(foreach f,$(PKG_FILES),$(call _pkg_resolve,$(f)))
+_PKG_STAGE_FILES := $(_PKG_ARTEFACTS) $(PKG_EXTRA_FILES_ABS)
+ifneq ($(_GM_MAKE_N),)
+$(filter-out $(wildcard $(_PKG_ARTEFACTS)),$(_PKG_ARTEFACTS)): ;
+endif
 endif
 
 
@@ -163,7 +211,14 @@ else
 DEP_JSON_ALL :=
 endif
 
+# Without rpmbuild the package keeps its place in the target set (libs need its component
+# header) and only the rpm step is skipped.  `+`: a message, not work left to do for make -q.
+ifeq ($(call _have,$(RPMBUILD)),)
+$(TARGET) ::
+	+$(call V_SKIP,$(TARGET)  (rpmbuild not found))
+else
 $(TARGET) :: $(PKG_OUT) $(DEP_JSON_ALL) ;
+endif
 
 
 ifeq ($(PKG_YAML_MODE),0)
@@ -175,18 +230,17 @@ $(PKG_OUT): $(_PKG_STAGE_FILES) $(PKG_SPEC_ABS) $(GM_FRAMEWORK_MK) | $(OUT_DIR)
 	$(Q): > $(PKG_HOOKS_LOG)
 	$(Q)DEP_TREE=$(DEP_TREE) DEP_TRACK_FILE=$(PKG_HOOKS_LOG) bash -c '. $(ADMIN_DIR)/tools/dep-hooks.sh && cp -fL $(_PKG_STAGE_FILES) $(SOURCES_DIR)/'
 	$(Q)sed $(foreach v,$(PKG_SPEC_VARS),-e 's|@$(v)@|$(subst |,\|,$($(v)))|g') $(PKG_SPEC_ABS) > $(GEN_SPEC)
+	$(Q)grep -q debug_package $(GEN_SPEC) || { \
+	    awk -v inc='$(PKG_DEBUGINFO_INC)' -v fix='$(_PKG_RPATH_FIX)' 'BEGIN { while ((getline l < inc) > 0) blk = blk l "\n" } \
+	        /^%install/ && !d { printf "%s\n", blk; d = 1; ins = 1; print; next } \
+	        ins && /^%[a-z]+/ { print "chmod -R u+w %{buildroot}\n" fix "\n"; ins = 0 } { print }' \
+	        $(GEN_SPEC) > $(GEN_SPEC).tmp && mv $(GEN_SPEC).tmp $(GEN_SPEC) ; }
 	$(Q): > $(PKG_BUILD_LOG)
-	$(Q)rpmbuild \
-	          --define '_topdir $(RPMBUILD_DIR)' \
-	          --define '_sourcedir $(SOURCES_DIR)' \
-	          --define '_specdir $(SPECS_DIR)' \
-	          --define '_builddir $(RPMBUILD_DIR)/BUILD' \
-	          --define '_rpmdir $(RPMBUILD_DIR)/RPMS' \
-	          --define '_srcrpmdir $(RPMBUILD_DIR)/SRPMS' \
-	          --define '_buildrootdir $(BUILDROOT_DIR)' \
-	          --target $(RPM_TARGET_ARCH) -bb $(GEN_SPEC) >>$(PKG_BUILD_LOG) 2>&1 \
-	    || { echo "pkg $(TARGET): rpmbuild failed (see $(PKG_BUILD_LOG))" >&2 ; exit 1 ; }
+	$(Q)$(call _RPMBUILD,--define '_sourcedir $(SOURCES_DIR)')
 	$(Q)cp -f $(RPMBUILD_DIR)/RPMS/$(RPM_TARGET_ARCH)/$(PKG_FILENAME) $@
+	$(Q)$(RM) $(OUT_DIR)/$(TARGET)-debuginfo-*.rpm
+	$(Q)if [ -f $(RPMBUILD_DIR)/RPMS/$(RPM_TARGET_ARCH)/$(PKG_DBG_FILENAME) ]; then \
+	    cp -f $(RPMBUILD_DIR)/RPMS/$(RPM_TARGET_ARCH)/$(PKG_DBG_FILENAME) $(PKG_DBG_OUT) ; fi
 
 
 # Plain-mode dep.json: hooks.jsonl is the src-path authority (rpmbuild's
@@ -223,39 +277,53 @@ $(PKG_OUT): $(PKG_YAML_ABS) $(_YAML_STAGE_PATHS) $(PKG_FILEGROUP_MAP_ABS) $(GM_F
 	    $(_PKG_INSTALL_ROOT_ARG) \
 	    --version $(PKG_VERSION) --release $(PKG_RELEASE) \
 	    --arch $(RPM_TARGET_ARCH) \
-	    $(_PKG_FG_MAP_ARG) \
+	    $(_PKG_FG_MAP_ARG) $(_PKG_SAN_DEP_ARGS) --install-post '$(_PKG_RPATH_FIX)' \
 	    --manifest-out $(PKG_MANIFEST) \
 	    --spec-out $(GEN_SPEC) >/dev/null
 	$(Q): > $(PKG_BUILD_LOG)
-	$(Q)rpmbuild \
-	          --define '_topdir $(RPMBUILD_DIR)' \
-	          --define '_specdir $(SPECS_DIR)' \
-	          --define '_builddir $(RPMBUILD_DIR)/BUILD' \
-	          --define '_rpmdir $(RPMBUILD_DIR)/RPMS' \
-	          --define '_srcrpmdir $(RPMBUILD_DIR)/SRPMS' \
-	          --define '_buildrootdir $(BUILDROOT_DIR)' \
-	          --target $(RPM_TARGET_ARCH) -bb $(GEN_SPEC) >>$(PKG_BUILD_LOG) 2>&1 \
-	    || { echo "pkg $(TARGET): rpmbuild failed (see $(PKG_BUILD_LOG))" >&2 ; exit 1 ; }
+	$(Q)$(call _RPMBUILD)
 	$(Q)cp -f $(RPMBUILD_DIR)/RPMS/$(RPM_TARGET_ARCH)/$(PKG_FILENAME) $@
+	$(Q)$(RM) $(OUT_DIR)/$(TARGET)-debuginfo-*.rpm
+	$(Q)if [ -f $(RPMBUILD_DIR)/RPMS/$(RPM_TARGET_ARCH)/$(PKG_DBG_FILENAME) ]; then \
+	    cp -f $(RPMBUILD_DIR)/RPMS/$(RPM_TARGET_ARCH)/$(PKG_DBG_FILENAME) $(PKG_DBG_OUT) ; fi
 
 
-# Standalone component-header target -- depends only on pkg.yaml
-$(PKG_COMPONENT_HDR): $(PKG_YAML_ABS) | $(PKG_COMPONENT_DIR)
+# Standalone component-header target.  Its inputs: pkg.yaml, the generator, and the values below
+# from the .mk / command line (a new PKG_VERSION must reach the macros).  The stamp sits next to
+# the header, which all variants share: a stamp per BUILD_DIR would regenerate it for each
+# variant in turn and recompile the others' consumers.
+_PKG_HDR_SIG   := $(PKG_VERSION)|$(_PKG_RELEASE_BASE)|$(PKG_YAML_VARS)|$(PKG_INSTALL_ROOT)
+_PKG_HDR_STAMP := $(PKG_COMPONENT_DIR).values
+$(eval $(call _FLAG_STAMP,$(_PKG_HDR_STAMP),_PKG_HDR_SIG,component.h values changed))
+$(_PKG_HDR_STAMP): | $(PKG_COMPONENT_DIR)
+
+$(PKG_COMPONENT_HDR): $(PKG_YAML_ABS) $(ADMIN_DIR)/make/scripts/pkg-build.py $(_PKG_HDR_STAMP) | $(PKG_COMPONENT_DIR)
 	$(V_GEN)
 	$(Q)python3 $(ADMIN_DIR)/make/scripts/pkg-build.py \
 	    --pkg $(PKG_YAML_ABS) \
 	    $(foreach kv,$(_PKG_VARS_ALL),--vars $(kv)) \
 	    $(_PKG_INSTALL_ROOT_ARG) \
-	    --version $(PKG_VERSION) --release $(PKG_RELEASE) \
+	    --version $(PKG_VERSION) --release $(_PKG_RELEASE_BASE) \
 	    --header-out $@ >/dev/null
 
 $(PKG_COMPONENT_DIR):
 	$(Q)mkdir -p $@
 
+# DEP_TREE=yes: the generated header's own dep.json, so the file-level graph runs pkg.yaml (and
+# this .mk) -> component.h -> every object that includes it.
+ifeq ($(DEP_TREE),yes)
+_PKG_HDR_DEP_JSON := $(PKG_COMPONENT_HDR).dep.json
+$(_PKG_HDR_DEP_JSON): $(PKG_COMPONENT_HDR) $(GM_FRAMEWORK_MK)
+	$(V_JSON)
+	$(Q)printf '%s\n' $(PKG_YAML_ABS) $(MAKEFILE) $(ADMIN_DIR)/make/scripts/pkg-build.py | \
+	    jq -R . | jq -s --arg f '$(PKG_COMPONENT_HDR)' '{file: $$f, deps: .}' > $@
+$(TARGET) :: $(_PKG_HDR_DEP_JSON) ;
+endif
+
 # `<pkg>-header` sub-goal for the dispatcher; header refresh is driven
 # by consumer libs via depend.mk's `<lib>: <pkg>-header` edges.
 .PHONY: header $(TARGET)-header
-header $(TARGET)-header: $(PKG_COMPONENT_HDR)
+header $(TARGET)-header: $(PKG_COMPONENT_HDR) $(_PKG_HDR_DEP_JSON)
 
 $(GM_GEN_DIR):
 	$(Q)mkdir -p $@
@@ -278,13 +346,21 @@ $(PKG_DEP_JSON): $(PKG_OUT) $(GM_FRAMEWORK_MK)
 
 endif # PKG_YAML_MODE
 
-%/$(BUILD_MODE):
+%/$(GM_MODE_DIR):
 	@$(MKDIR) $@
 
 clean:
 	$(Q)$(RM) -r $(RPMBUILD_DIR)
-	$(Q)$(RM) $(PKG_OUT) $(PKG_HOOKS_LOG) $(PKG_BUILD_LOG) $(PKG_DEP_JSON) $(PKG_MANIFEST)
+	$(Q)$(RM) $(PKG_OUT) $(PKG_HOOKS_LOG) $(PKG_BUILD_LOG) $(PKG_DEP_JSON) $(PKG_MANIFEST) $(_PKG_HDR_DEP_JSON)
+	$(Q)$(RM) $(OUT_DIR)/$(TARGET)-debuginfo-*.rpm
 	$(V_CLEAN)
+
+GM_SHOW_FIELDS := mode version rpm in-tree requires
+SHOW_mode      = $(if $(PKG_YAML_ABS),yaml ($(call _rel,$(PKG_YAML_ABS))),spec ($(call _rel,$(PKG_SPEC_ABS))))
+SHOW_version   = $(PKG_VERSION)-$(PKG_RELEASE)
+SHOW_rpm       = $(call _rel,$(PKG_OUT))$(if $(call _have,$(RPMBUILD)),,  (not built here: rpmbuild not found))
+SHOW_in-tree   = $(or $(sort $(if $(PKG_YAML_ABS),$(_YAML_INTREE),$(PKG_FILES))),-)
+SHOW_requires  = $(or $(PKG_RPM_DEPS),-)
 
 
 endif # DRY_RUN

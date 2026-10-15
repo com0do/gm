@@ -1,14 +1,16 @@
 name: Set up gm build environment
 description: >-
-  Install everything gm's Makefile expects on a Rocky 8 (or ubuntu)
-  runner: gcc / g++ / ar / make, jq, python3 + PyYAML, ccache, gcovr,
-  lcov, rpmbuild, go (for `example/g1`), and shellcheck.  Also
-  provisions ccache with a stable key derived from OS + BUILD_MODE
-  so incremental C/C++ builds stay hot across PR iterations.
+  Install everything gm's Makefile expects on Rocky 9 / Rocky 8 (or
+  ubuntu) runner: gcc / g++ / binutils (ar) / make, jq, Python 3.12 +
+  PyYAML, ccache, gcovr, lcov, rpmbuild, go (for `example/exporter` and `example/cgo`), and
+  shellcheck.  Also provisions ccache with a stable key derived from
+  OS + BUILD_MODE so incremental C/C++ builds stay hot across PR
+  iterations.
 
   Runs on both:
-    * `container: rockylinux:8` (the accurate build target;
+    * `container: rockylinux:9` (PR CI / production parity;
       BUILD_ARCH=rhlinux)
+    * `container: rockylinux:8` (nightly compat lane)
     * `ubuntu-latest`           (fallback for lint / docs / docker jobs)
 
   Inputs are all optional -- callers just `uses:` the action and
@@ -16,8 +18,8 @@ description: >-
 
 inputs:
   build-mode:
-    description: BUILD_MODE (debug / release / coverage) -- used to
-                 shape ccache key.  Default 'debug'.
+    description: Label for the ccache key (a BUILD_MODE or a CI lane name).
+                 Default 'debug'.
     required: false
     default: 'debug'
   install-docker:
@@ -30,18 +32,32 @@ inputs:
                  Default 'false' (only coverage job needs them).
     required: false
     default: 'false'
+  sanitize:
+    description: SANITIZE value the job will build with (address, undefined,
+                 thread; comma separated; '' / 'none' = none).  Installs the
+                 matching runtime RPMs (libasan / libubsan / libtsan) on the
+                 RHEL family -- Ubuntu's gcc already pulls them in.
+    required: false
+    default: ''
   install-go:
-    description: Install golang toolchain for `example/g1`.  Default
+    description: Install golang toolchain for the go examples (example/exporter, example/cgo).  Default
                  'true' since it's cheap.
     required: false
     default: 'true'
   install-java:
     description: Install a JDK (javac + jar + java) for target.java.mk
-                 (example/j1, example/j2).  Default 'true' -- the
+                 (example/dashboard).  Default 'true' -- the
                  install is cheap, and the C-only lane still needs
-                 java for the smoke run of j2.jar in the build job.
+                 java for the pipeline run (tmview.jar) in the build job.
     required: false
     default: 'true'
+
+outputs:
+  ccache-key:
+    description: >-
+      Primary actions/cache key for ccache.  Pass to save-gm-cache
+      after compile steps in the same job.
+    value: ${{ steps.ccache-restore.outputs.cache-primary-key }}
 
 runs:
   using: composite
@@ -55,111 +71,179 @@ runs:
       run: |
         if [ -f /etc/rocky-release ] || [ -f /etc/redhat-release ]; then
           echo "family=rhel" >> "$GITHUB_OUTPUT"
+          # Cache keys: distinguish Rocky 8 vs 9 (glibc + RPM sets differ).
+          . /etc/os-release
+          echo "distro=${ID}-${VERSION_ID}" >> "$GITHUB_OUTPUT"
         else
           echo "family=ubuntu" >> "$GITHUB_OUTPUT"
+          echo "distro=ubuntu" >> "$GITHUB_OUTPUT"
         fi
+        # The dnf cache is renewed weekly: a hit keeps its metadata for 7 days (see below).
+        echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
 
-    # ────────────────────────────────────────────────────────────
-    # RHEL / Rocky path (matches production target: BUILD_ARCH=rhlinux)
-    #
-    # We cache /var/cache/dnf across runs -- dnf lays out downloaded
-    # RPMs and repodata there, and re-hitting the mirror is the slow
-    # part of a fresh dnf install.  Cache key is scoped to os-family
-    # + a hash of THIS action's inputs so a change to the package
-    # set invalidates cleanly.
-    # ────────────────────────────────────────────────────────────
-    - name: Restore dnf cache (RHEL family)
+    # actions/cache compresses with zstd when it finds the zstd command, else with gzip, and the
+    # compression is part of the cache version.  The Rocky images have no zstd, the toolchain
+    # install pulls it in: the dnf cache was looked up without zstd and saved with it, and never
+    # matched.  So zstd is installed before the lookup -- from its own small cache of the rpms,
+    # saved before they are installed (gzip, like its lookup).  Fetching them from the repos on
+    # every run cost a repo's metadata, 40 MB from a mirror that can take minutes.
+    - name: Restore the zstd rpms (RHEL family)
+      id: zstd-rpms
       if: steps.os.outputs.family == 'rhel'
-      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
       with:
-        path: |
-          /var/cache/dnf
-          /var/lib/dnf
-        # Bump the suffix (v1) if the package list below changes so
-        # old caches don't shadow the update.  Salting with `runner.os`
-        # keeps ubuntu vs rocky caches distinct.
-        key: dnf-${{ runner.os }}-v1-${{ inputs.build-mode }}-${{ inputs.install-coverage }}-${{ inputs.install-go }}-${{ inputs.install-java }}
-        restore-keys: |
-          dnf-${{ runner.os }}-v1-
+        path: .ci-cache/zstd-rpms
+        key: zstd-rpms-${{ steps.os.outputs.distro }}-v1
 
-    - name: Install base toolchain (RHEL family)
+    - name: Download the zstd rpms (RHEL family, first run)
+      if: steps.os.outputs.family == 'rhel' && steps.zstd-rpms.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        # EL9 has zstd in BaseOS, EL8 in AppStream (libzstd in BaseOS).
+        dnf install -y -q --downloadonly --downloaddir=.ci-cache/zstd-rpms --setopt=install_weak_deps=False \
+            --disablerepo='*' --enablerepo=baseos --enablerepo=appstream zstd
+        ls .ci-cache/zstd-rpms
+
+    - name: Save the zstd rpms (RHEL family, first run)
+      if: steps.os.outputs.family == 'rhel' && steps.zstd-rpms.outputs.cache-hit != 'true'
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+      with:
+        path: .ci-cache/zstd-rpms
+        key: zstd-rpms-${{ steps.os.outputs.distro }}-v1
+
+    - name: Install zstd (RHEL family)
       if: steps.os.outputs.family == 'rhel'
       shell: bash
       run: |
         set -euo pipefail
-        # `--setopt=keepcache=1` makes dnf preserve downloaded RPMs
-        # for the actions/cache above; otherwise dnf auto-cleans.
-        dnf install -y --setopt=install_weak_deps=False \
-            --setopt=keepcache=1 \
-            gcc gcc-c++ make ar binutils \
-            python3 python3-pip python3-pyyaml \
+        command -v zstd >/dev/null && exit 0
+        dnf install -y -q --disablerepo='*' .ci-cache/zstd-rpms/*.rpm \
+          || dnf install -y -q --setopt=install_weak_deps=False \
+                 --disablerepo='*' --enablerepo=baseos --enablerepo=appstream zstd
+        zstd --version
+
+    # RHEL / Rocky: dnf cache MUST live under GITHUB_WORKSPACE.
+    # Container jobs only persist workspace paths through actions/cache;
+    # caching /var/cache/dnf directly never saves across runs.
+    - name: Restore dnf cache (RHEL family)
+      id: dnf-cache
+      if: steps.os.outputs.family == 'rhel'
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+      with:
+        path: .ci-cache/dnf
+        key: dnf-${{ steps.os.outputs.distro }}-v7-${{ steps.os.outputs.week }}-${{ inputs.install-coverage }}-${{ inputs.sanitize }}-${{ inputs.install-go }}-${{ inputs.install-java }}-${{ hashFiles('.github/actions/setup-gm-env/action.yml') }}
+        restore-keys: |
+          dnf-${{ steps.os.outputs.distro }}-v7-${{ steps.os.outputs.week }}-
+          dnf-${{ steps.os.outputs.distro }}-v7-
+
+    - name: Install base toolchain (RHEL family)
+      if: steps.os.outputs.family == 'rhel'
+      shell: bash
+      env:
+        DNF_CACHE_HIT: ${{ steps.dnf-cache.outputs.cache-hit }}
+      run: |
+        set -euo pipefail
+        cache_root="${GITHUB_WORKSPACE}/.ci-cache/dnf"
+        mkdir -p "${cache_root}/cache" "${cache_root}/lib"
+        _dnf_opt() {
+          local key="$1" val="$2"
+          if grep -q "^${key}=" /etc/dnf/dnf.conf; then
+            sed -i "s|^${key}=.*|${key}=${val}|" /etc/dnf/dnf.conf
+          else
+            echo "${key}=${val}" >> /etc/dnf/dnf.conf
+          fi
+        }
+        _dnf_opt cachedir "${cache_root}/cache"
+        _dnf_opt persistdir "${cache_root}/lib"
+        _dnf_opt keepcache 1
+        echo "dnf actions/cache hit: ${DNF_CACHE_HIT:-unknown}"
+        meta_expire=21600
+        if [ "${DNF_CACHE_HIT:-}" = "true" ]; then
+          meta_expire=604800
+        fi
+        # A mirror caught mid-sync serves a repomd.xml whose primary / filelists are on no mirror
+        # yet: every download 404s (EPEL, Oct 2026).  Drop the metadata and fetch it again.
+        _dnf_install() {
+          local try
+          for try in 1 2 3; do
+            dnf install -y --setopt=install_weak_deps=False --setopt=keepcache=1 \
+                --setopt=metadata_expire="${meta_expire}" "$@" && return 0
+            [ "$try" = 3 ] && break
+            echo "setup-gm-env: dnf install failed (attempt $try of 3); refetching the repo metadata" >&2
+            dnf clean metadata
+            sleep $((try * 30))
+          done
+          return 1
+        }
+        _dnf_install epel-release
+        _dnf_install \
+            gcc gcc-c++ make binutils \
             jq git which \
             rpm-build rpmdevtools \
             findutils tar gzip \
-            ccache shellcheck
-        ln -sf /usr/bin/python3 /usr/local/bin/python || true
+            expat python3.12 python3.12-pip \
+            ccache ShellCheck
+        san_pkgs=""
+        for s in $(echo "${{ inputs.sanitize }}" | tr ',' ' '); do
+          case "$s" in
+            address)   san_pkgs="$san_pkgs libasan" ;;
+            undefined) san_pkgs="$san_pkgs libubsan" ;;
+            thread)    san_pkgs="$san_pkgs libtsan" ;;
+            none|"")   ;;
+            *) echo "setup-gm-env: unknown sanitizer '$s'" >&2; exit 1 ;;
+          esac
+        done
+        if [ -n "$san_pkgs" ]; then
+          # shellcheck disable=SC2086  # word-split on purpose
+          _dnf_install $san_pkgs
+        fi
+        if [ "${{ inputs.install-go }}" = "true" ]; then
+          _dnf_install golang || true
+        fi
+        if [ "${{ inputs.install-java }}" = "true" ]; then
+          _dnf_install java-11-openjdk-devel || true
+        fi
+        alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 100
+        alternatives --set python3 /usr/bin/python3.12
 
     - name: Install coverage tools (RHEL family)
       if: steps.os.outputs.family == 'rhel' && inputs.install-coverage == 'true'
       shell: bash
       run: |
         set -euo pipefail
-        dnf install -y --enablerepo=powertools --setopt=install_weak_deps=False \
+        # Rocky 8: powertools.  Rocky 9: crb (same role, renamed).
+        if dnf repolist --all 2>/dev/null | awk '{print $1}' | grep -qx crb; then
+          extra_repo=crb
+        else
+          extra_repo=powertools
+        fi
+        dnf install -y --enablerepo="${extra_repo}" \
+            --setopt=install_weak_deps=False --setopt=keepcache=1 \
             lcov perl-DateTime perl-JSON perl-App-cpanminus || true
-        python3 -m pip install --user --no-warn-script-location gcovr
-
-    - name: Install Go (RHEL family)
-      if: steps.os.outputs.family == 'rhel' && inputs.install-go == 'true'
-      shell: bash
-      run: |
-        set -euo pipefail
-        dnf install -y --setopt=install_weak_deps=False golang || true
-
-    - name: Install JDK (RHEL family)
-      if: steps.os.outputs.family == 'rhel' && inputs.install-java == 'true'
-      shell: bash
-      run: |
-        set -euo pipefail
-        # java-11-openjdk-devel is available on Rocky 8/9 without
-        # extra repos; ships javac + jar + java together.  target.java.mk
-        # calls javac/jar directly (no JAVA_HOME dance), so PATH is
-        # all we need.
-        dnf install -y --setopt=install_weak_deps=False \
-            java-11-openjdk-devel || true
+        PIP_CACHE_DIR="${GITHUB_WORKSPACE}/.ci-cache/pip" python3 -m pip install gcovr
 
     # ────────────────────────────────────────────────────────────
-    # Ubuntu path (fallback for lint / docker / docs jobs)
+    # Ubuntu path (GitHub-hosted runner, no container: the container and integration jobs)
     #
-    # apt caching via actions/cache -- /var/cache/apt/archives holds
-    # every downloaded .deb.  Same key discipline as the dnf branch.
-    # Without this the container-build job burns ~25s on `apt-get
-    # install docker...` every single run.
+    # No apt cache: the runner image already has the large tools (JDKs, Go), what apt still
+    # fetches is a few MB.  (Caching /var/cache/apt/archives never worked: its
+    # partial/ and lock are root-only, so the save failed every run.)
     # ────────────────────────────────────────────────────────────
-    - name: Restore apt cache (Ubuntu)
+    - name: Set up Python 3.12 (Ubuntu)
       if: steps.os.outputs.family == 'ubuntu'
-      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
       with:
-        path: /var/cache/apt/archives
-        key: apt-${{ runner.os }}-v1-${{ inputs.install-coverage }}-${{ inputs.install-go }}-${{ inputs.install-java }}-${{ inputs.install-docker }}
-        restore-keys: |
-          apt-${{ runner.os }}-v1-
+        python-version: '3.12'
 
     - name: Install base toolchain (Ubuntu)
       if: steps.os.outputs.family == 'ubuntu'
       shell: bash
       run: |
         set -euo pipefail
-        # Prevent apt-get from wiping the cache we just restored --
-        # DPkg::Post-Invoke's `apt-get clean` fires by default on
-        # GH runners because /etc/apt/apt.conf.d/docker-clean is
-        # present.  Neuter it for the duration of the job.
-        sudo rm -f /etc/apt/apt.conf.d/docker-clean
-        echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' \
-            | sudo tee /etc/apt/apt.conf.d/keep-cache >/dev/null
         sudo apt-get update -qq
         sudo apt-get install -y --no-install-recommends \
             build-essential ccache jq \
-            python3 python3-pip python3-yaml \
             rpm shellcheck git ca-certificates
 
     - name: Install coverage tools (Ubuntu)
@@ -168,54 +252,74 @@ runs:
       run: |
         set -euo pipefail
         sudo apt-get install -y --no-install-recommends lcov
-        python3 -m pip install --user --no-warn-script-location gcovr
+        python3 -m pip install gcovr
 
+    # Go and the JDK come with GitHub's Ubuntu image; apt only on a runner without them.  Their
+    # 175 MB of .debs once took the integration job past its 25 minutes on a slow mirror.
     - name: Install Go (Ubuntu)
       if: steps.os.outputs.family == 'ubuntu' && inputs.install-go == 'true'
       shell: bash
       run: |
         set -euo pipefail
-        sudo apt-get install -y --no-install-recommends golang-go
+        # The image's default Go (1.24) is on PATH.
+        if ! command -v go >/dev/null; then
+          sudo apt-get install -y --no-install-recommends golang-go
+        fi
 
     - name: Install JDK (Ubuntu)
       if: steps.os.outputs.family == 'ubuntu' && inputs.install-java == 'true'
       shell: bash
       run: |
         set -euo pipefail
-        sudo apt-get install -y --no-install-recommends default-jdk-headless
+        # The image's default JDK (17) is on PATH.
+        if ! command -v javac >/dev/null || ! command -v jar >/dev/null; then
+          sudo apt-get install -y --no-install-recommends default-jdk-headless
+        fi
 
-    # ────────────────────────────────────────────────────────────
-    # ccache: point PATH prefix at /usr/lib*/ccache so gcc/g++
-    # invocations from env.mk (`/usr/bin/gcc`) transparently
-    # cache -- and set CCACHE_DIR to a stable location we cache
-    # via actions/cache.
-    # ────────────────────────────────────────────────────────────
-    - name: Prime ccache PATH + dir
+    - name: Restore pip cache
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+      with:
+        path: .ci-cache/pip
+        key: pip-${{ steps.os.outputs.distro }}-py3.12-${{ hashFiles('production/requirements.txt') }}
+        restore-keys: |
+          pip-${{ steps.os.outputs.distro }}-py3.12-
+
+    - name: Install gm Python runtime deps
       shell: bash
       run: |
         set -euo pipefail
-        # Rocky ships ccache wrappers at /usr/lib64/ccache/, ubuntu at
-        # /usr/lib/ccache/.  Prepend whichever exists.
-        for d in /usr/lib64/ccache /usr/lib/ccache ; do
-          [ -d "$d" ] && echo "$d" >> "$GITHUB_PATH"
-        done
-        mkdir -p "$HOME/.ccache"
-        echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
-        # Bound cache to keep the tarball reasonable across the
-        # matrix (debug + release).  10 GB is well above what
-        # gm's example/ needs but leaves room for user forks.
-        ccache -M 2G || true
+        export PIP_CACHE_DIR="${GITHUB_WORKSPACE}/.ci-cache/pip"
+        mkdir -p "$PIP_CACHE_DIR"
+        python3 -m pip install \
+            'PyYAML>=6.0,<7' 'jsonschema>=4.19,<5'
+
+    # ccache: flags.mk wraps as `ccache /usr/bin/gcc` via CCACHE_PATH env.
+    # Do NOT prepend /usr/lib*/ccache to PATH -- the wrappers need the
+    # real compiler on PATH and break bare `gcc` calls in CI scripts.
+    - name: Prime ccache
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p "${GITHUB_WORKSPACE}/.ci-cache/ccache"
+        echo "CCACHE_DIR=${GITHUB_WORKSPACE}/.ci-cache/ccache" >> "$GITHUB_ENV"
+        if command -v ccache >/dev/null 2>&1; then
+          echo "CCACHE_ENABLE=yes" >> "$GITHUB_ENV"
+          echo "CCACHE_PATH=$(command -v ccache)" >> "$GITHUB_ENV"
+          ccache -M 2G
+        fi
 
     - name: Restore ccache
-      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+      id: ccache-restore
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
       with:
-        path: ~/.ccache
-        # Keying by BUILD_MODE keeps debug + release from evicting
-        # each other; OS keeps rocky/ubuntu separated.
-        key: ccache-${{ runner.os }}-${{ inputs.build-mode }}-${{ github.sha }}
+        path: .ci-cache/ccache
+        # Stable across commits; ccache invalidates per translation unit
+        # when source/flags change.  Bump v3 or flags.mk hash when the
+        # toolchain / global compile flags change.
+        key: ccache-${{ steps.os.outputs.distro }}-${{ inputs.build-mode }}-v3-${{ hashFiles('production/make/flags.mk', 'production/make/env.mk') }}
         restore-keys: |
-          ccache-${{ runner.os }}-${{ inputs.build-mode }}-
-          ccache-${{ runner.os }}-
+          ccache-${{ steps.os.outputs.distro }}-${{ inputs.build-mode }}-v3-
+          ccache-${{ steps.os.outputs.distro }}-${{ inputs.build-mode }}-
 
     # ────────────────────────────────────────────────────────────
     # Docker (only when caller opts in -- ubuntu-latest only).
@@ -224,35 +328,12 @@ runs:
       if: inputs.install-docker == 'true' && steps.os.outputs.family == 'ubuntu'
       uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435  # v3.11.1
 
-    # ────────────────────────────────────────────────────────────
-    # Sanity: print versions so a broken CI is easy to diagnose.
-    # ────────────────────────────────────────────────────────────
     - name: Show tool versions
       shell: bash
       run: |
-        set +e
-        echo "=== toolchain ==="
-        which gcc && gcc --version | head -1
-        which g++ && g++ --version | head -1
-        which ar  && ar  --version | head -1
-        which ld  && ld  --version | head -1
-        which make && make --version | head -1
-        which python3 && python3 --version
-        which jq  && jq  --version
-        which ccache && ccache --version | head -1
-        which rpmbuild && rpmbuild --version
-        which shellcheck && shellcheck --version | head -3
-        if [ "${{ inputs.install-go }}" = "true" ]; then
-          which go && go version
-        fi
-        if [ "${{ inputs.install-java }}" = "true" ]; then
-          which javac && javac -version 2>&1 | head -1
-          which jar   && jar --version 2>&1 | head -1
-          which java  && java -version 2>&1 | head -1
-        fi
-        if [ "${{ inputs.install-coverage }}" = "true" ]; then
-          which gcovr && gcovr --version | head -1
-          which lcov  && lcov  --version | head -1
-        fi
-        echo "=== python3 modules ==="
-        python3 -c 'import yaml; print("PyYAML", yaml.__version__)'
+        /usr/bin/gcc --version | head -1
+        if command -v go >/dev/null; then go version; fi
+        if command -v javac >/dev/null; then javac -version; fi
+        python3 --version
+        command -v ccache >/dev/null && ccache --version | head -1
+        python3 -c 'import yaml, jsonschema; print("PyYAML", yaml.__version__)'

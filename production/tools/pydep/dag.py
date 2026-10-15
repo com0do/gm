@@ -4,7 +4,7 @@ Loads every `.dep.json` under a build directory into an in-memory
 graph.  Two adjacency maps:
 
     artifacts[<abs realpath'd artifact>] = {
-        "kind":   "lib" | "exe" | "pkg" | "img" | "obj" | "java",
+        "kind":   "lib" | "exe" | "pkg" | "img" | "obj" | "java" | "gen",
         "target": <make-invocable name>,
         "deps":   [<abs realpath>, ...],
         "rpms":   [[name, ver, rel, arch], ...]   # img/pkg only
@@ -13,7 +13,7 @@ graph.  Two adjacency maps:
 
 **Path canonicalisation happens HERE** (not at emit time).  Build
 recipes emit absolute-but-possibly-symlinked paths (`OUT_DIR` views
-like `build/lib/rhlinux/debug/libt2.so`); `_absorb()` pipes every
+like `build/lib/rhlinux/debug/libtmstats.so`); `_absorb()` pipes every
 entry through `paths.normalize()` which applies `os.path.realpath`
 so the in-memory graph is keyed on real disk paths.  Rationale:
 keeps DEP_TREE=yes build recipes minimal + fast, resolves once at
@@ -66,7 +66,6 @@ class DepGraph:
     def load(self) -> "DepGraph":
         for dep_file in sorted(self.build_dir.rglob("*.dep.json")):
             self._absorb(dep_file)
-        self._bridge_pkg_yaml_to_libs()
         self._apply_framework_escape()
         self._loaded = True
         return self
@@ -95,62 +94,6 @@ class DepGraph:
         for fw in frameworks:
             for d in self.artifacts[fw]["deps"]:
                 self.consumers[d].update(non_fw)
-
-    def _bridge_pkg_yaml_to_libs(self) -> None:
-        """Close the DAG gap between `pkg.yaml` and every lib it packages.
-
-        pkg-build.py generates `$(GM_GEN_DIR)/<pkg>/component.h` from
-        the pkg's yaml.  Consumer libs list that .h in their dep.json,
-        but the .h itself has no dep.json of its own -- so a walk from
-        yaml stops at the pkg node and never crosses to the libs.
-
-        pkg.yaml is the source of truth for which libs belong to which
-        pkg, so we parse it here and bridge `yaml -> lib` directly.
-        No build-recipe changes needed; the yaml is already listed as
-        a dep of the pkg artifact.
-
-        Bridge only fires when the lib ACTUALLY consumes THIS pkg's
-        `component.h` (i.e. it's in the lib's dep.json's deps[]).
-        This respects the `PKG_HEADERS :=` opt-out in a lib's .mk:
-        an opted-out lib has no component.h in its deps, so the
-        bridge silently skips it -- no false-positive rebuilds.
-        """
-        try:
-            import yaml  # PyYAML; optional at query time
-        except ImportError:
-            return
-        # Pre-index libs by basename for O(1) matching.
-        lib_by_name: Dict[str, str] = {}
-        for art, info in self.artifacts.items():
-            if info["kind"] == Kind.LIB:
-                lib_by_name[Path(art).name] = art
-        for pkg_art, pkg_info in list(self.artifacts.items()):
-            if pkg_info["kind"] != Kind.PKG:
-                continue
-            for d in pkg_info["deps"]:
-                if not d.endswith((".yaml", ".yml")):
-                    continue
-                if not Path(d).is_file():
-                    continue
-                try:
-                    data = yaml.safe_load(Path(d).read_text())
-                except Exception:
-                    continue
-                if not isinstance(data, dict):
-                    continue
-                # this pkg's component.h path suffix -- used as an
-                # opt-in check on the consumer lib below.
-                pkg_id = data.get("pkg", "")
-                comp_suffix = f"/{pkg_id}/component.h" if pkg_id else "/component.h"
-                for f in (data.get("files") or []):
-                    src = f if isinstance(f, str) else (f.get("src") or "")
-                    lib_name = Path(src).name  # e.g. "libt2.so"
-                    lib_art = lib_by_name.get(lib_name)
-                    if not lib_art:
-                        continue
-                    lib_deps = self.artifacts[lib_art]["deps"]
-                    if any(dep.endswith(comp_suffix) for dep in lib_deps):
-                        self.consumers[d].add(lib_art)
 
     def _absorb(self, dep_file: Path) -> None:
         try:

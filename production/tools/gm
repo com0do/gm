@@ -4,7 +4,7 @@
 # Without this wrapper a user has to remember three unrelated command
 # shapes:
 #
-#     make libt1                                        # build
+#     make libtmcore                                    # build
 #     python3 production/make/scripts/dep_query.py ...  # dep queries
 #     container/imageBuild.py build image.yaml          # images
 #
@@ -12,7 +12,7 @@
 # `gm` unifies them and locates the repo root itself, so every
 # command works from any directory.
 #
-# Install:
+# Install (a symlink, or PATH: the script finds its own checkout through it):
 #     ln -s "$PWD/production/tools/gm" ~/.local/bin/gm
 #
 # Design: this is a THIN dispatcher.  It never reimplements build
@@ -24,14 +24,22 @@
 set -uo pipefail
 
 # ------------------------------------------------------------------
-# Locate the gm tree.
+# Locate the gm tree -- the directory make runs in.  Two layouts
+# (docs/1-USER_GUIDE.md 7.5):
 #
-# Walk up from CWD looking for the marker pair (a Makefile plus a
-# production/make/env.mk).  Both are required: a bare Makefile could
-# belong to any project, and production/ alone could be a vendored
-# copy inside a tree whose root is further up.
+#   SINGLE_REPO=Y (default)  gm is vendored in the project: walk up from
+#       CWD to the marker pair (a Makefile plus production/make/env.mk).
+#       Both are required: a bare Makefile could belong to any project,
+#       and production/ alone could be a vendored copy inside a tree
+#       whose root is further up.
+#   SINGLE_REPO=N (exported)  gm is a checkout next to the project
+#       repo(s): the tree is the checkout this script lives in, whatever
+#       CWD is; PROJ_TOP is its parent directory.
+#
+# A vendored tree found above CWD always wins: the project keeps the
+# framework it pins, and builds as SINGLE_REPO=Y even when N is exported.
 # ------------------------------------------------------------------
-find_proj_top() {
+find_marker() {
     local d="${GM_PROJ_TOP:-$PWD}"
     while [ "$d" != "/" ]; do
         if [ -f "$d/Makefile" ] && [ -f "$d/production/make/env.mk" ]; then
@@ -43,15 +51,31 @@ find_proj_top() {
     return 1
 }
 
-PROJ_TOP=$(find_proj_top) || {
+self_tree() {
+    local d
+    d=$(readlink -f "${BASH_SOURCE[0]}") && d=$(dirname "$(dirname "$(dirname "$d")")") || return 1
+    [ -f "$d/Makefile" ] && [ -f "$d/production/make/env.mk" ] && printf '%s' "$d"
+}
+
+MARKER=$(find_marker) || MARKER=
+SELF=$(self_tree) || SELF=
+if [ "${SINGLE_REPO:-Y}" = N ] && [ -n "$SELF" ] && { [ -z "$MARKER" ] || [ "$MARKER" = "$SELF" ]; }; then
+    PROJ_TOP=$SELF LAYOUT=N
+elif [ -n "$MARKER" ]; then
+    PROJ_TOP=$MARKER LAYOUT=Y
+else
     echo "gm: not inside a gm tree (no Makefile + production/make/env.mk above $PWD)" >&2
+    if [ -n "$SELF" ]; then
+        echo "    to build the projects next to $SELF: export SINGLE_REPO=N" >&2
+    fi
     echo "    set GM_PROJ_TOP=/path/to/tree to override" >&2
     exit 2
-}
+fi
 
 DEP_QUERY="$PROJ_TOP/production/make/scripts/dep_query.py"
 IMAGE_BUILD="$PROJ_TOP/container/imageBuild.py"
 PRECHECK="$PROJ_TOP/production/tools/precheck.sh"
+GMDBG="$PROJ_TOP/production/tools/gmdbg.py"
 
 # ANSI only on a tty.
 if [ -t 1 ]; then C_B=$'\e[1m'; C_D=$'\e[2m'; C_R=$'\e[0m'
@@ -60,12 +84,12 @@ else C_B=; C_D=; C_R=; fi
 # `--no-print-directory` here, not just in env.mk: the outer make
 # emits its "Entering/Leaving directory" banner for `-C` before it
 # ever parses env.mk, so MAKEFLAGS from there is too late.
-run_make() { make --no-print-directory -C "$PROJ_TOP" "$@" ; }
+run_make() { make --no-print-directory -C "$PROJ_TOP" SINGLE_REPO="$LAYOUT" "$@" ; }
 
 usage() {
 cat <<EOF
 ${C_B}gm${C_R} -- unified entry point for the gm build system
-     tree: ${C_D}$PROJ_TOP${C_R}
+     tree: ${C_D}$PROJ_TOP${C_R}  (SINGLE_REPO=$LAYOUT)
 
 ${C_B}BUILD${C_R}
   gm build [<target>...]      build targets (default: all)
@@ -73,6 +97,8 @@ ${C_B}BUILD${C_R}
   gm distclean                wipe the output tree
   gm rebuild <target>...      clean + build those targets
   gm list                     list every discovered target
+  gm show [<target|type>...]  what gm derived: all targets, one type (lib exe test go java
+                              pkg import-lib import-exe), or the details of these targets
   gm test [<name>...]         build + run tests (default: all)
 
 ${C_B}DEPENDENCIES${C_R}
@@ -90,13 +116,22 @@ ${C_B}QUALITY${C_R}
   gm check                    run every local static check (precheck)
   gm coverage [lcov]          coverage report (gcovr, or lcov)
 
+${C_B}DEBUG${C_R} (field crashes; docs 3.16)
+  gm core <core> [--exe E]    offline crash analysis: signal, fault, cause, missing symbols
+  gm watch --pid P --sym S    who writes this address? (hardware watchpoint, ~native speed)
+           [--kernel]         ...also catch read()/recv() writing into it
+  gm symbols add|list|find    root-free debuginfo store (debuginfo rpm / dir / ELF)
+
 ${C_B}ESCAPE HATCH${C_R}
   gm <anything else>          forwarded verbatim to \`make -C $PROJ_TOP\`
-                              e.g. \`gm libt1 BUILD_MODE=release\`
+                              e.g. \`gm tmd BUILD_MODE=release\`
 
 ${C_B}COMMON FLAGS${C_R} (pass through to make)
   -jN                         parallel
-  BUILD_MODE=debug|release|coverage
+  BUILD_MODE=debug|release
+  COVERAGE=1                  gcov instrumentation (any BUILD_MODE)
+  SANITIZE=address[,undefined]|thread   sanitizer build (any BUILD_MODE)
+  CC=<path> CXX=<path>        compilers (default: gcc/g++ on PATH)
   GM_OUT=<dir>                relocate the output tree
   DEP_TREE=yes                emit .dep.json sidecars while building
 EOF
@@ -126,7 +161,10 @@ case "$cmd" in
         need_arg rebuild "${1:-}"
         for t in "$@"; do run_make "$t" SUB_TARGET=clean || exit $?; done
         run_make "$@" ;;
-    list)             run_make -s list-targets ;;
+    list)             run_make -s list ;;
+    show)
+        if [ $# -eq 0 ]; then run_make -s show
+        else run_make -s "${@/#/show-}" ; fi ;;
     test)
         if [ $# -eq 0 ]; then run_make test
         else run_make test TESTS="$*" ; fi ;;
@@ -136,7 +174,10 @@ case "$cmd" in
     graph)            run_make deps-files ;;
     changes)
         need_arg changes "${1:-}"
-        run_make changes CHANGES="$*" ;;
+        # Paths are relative to where the user is, not to the tree.
+        abs=()
+        for p in "$@"; do abs+=("$(realpath -m -- "$p")"); done
+        run_make changes CHANGES="${abs[*]}" ;;
     since)
         need_arg since "${1:-}"
         run_make changes-since SINCE="$1" ;;
@@ -163,12 +204,15 @@ case "$cmd" in
             *)     echo "gm coverage: expected 'gcovr' or 'lcov'" >&2; exit 2 ;;
         esac ;;
 
+    # ---- debugging (gmdbg.py) -------------------------------------
+    watch|core|symbols) exec python3 "$GMDBG" "$cmd" "$@" ;;
+
     # ---- raw dep_query (power users) ------------------------------
     dep-query|dq)     exec python3 "$DEP_QUERY" "$@" ;;
 
     # ---- escape hatch ---------------------------------------------
-    # Anything unrecognised is a make goal.  Keeps `gm libt1`,
-    # `gm pkg-p2 BUILD_MODE=release`, `gm -j8 all` working without
+    # Anything unrecognised is a make goal.  Keeps `gm libtmcore`,
+    # `gm pkg-tmd BUILD_MODE=release`, `gm -j8 all` working without
     # this script needing to know every target name.
     *)                run_make "$cmd" "$@" ;;
 esac

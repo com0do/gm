@@ -1,0 +1,57 @@
+module pkg-tmd {
+  yang-version 1.1;
+  namespace "urn:gm:pkg-tmd";
+  prefix tmd;
+
+  import gm-common {
+    prefix gmc;
+  }
+
+  organization "gm";
+  contact      "gm-dev@example.com";
+  description  "Configuration schema for pkg-tmd, the telemetry daemon of gm's example
+                product (example/daemon).  The same settings as its tmd.conf.  Every
+                leaf here is authored + defaulted in ../../generic/generic.yaml.
+                Runtime access at pkg-tmd is via cmproxy using
+                ../../templates/pkg-tmd.template.yaml.";
+
+  revision 2026-10-20 {
+    description "Initial release.";
+  }
+
+  container config {
+    description "Root of pkg-tmd's configurable state.";
+
+    uses gmc:process-identity;
+
+    leaf window {
+      type uint32 {
+        range "1..4096";
+      }
+      default 120;
+      description "Samples kept per metric (libtmcore's ring holds at most 4096).";
+    }
+
+    leaf report-every {
+      type uint32;
+      default 0;
+      description "Write a snapshot every N samples; 0: once, at the end of the input.";
+    }
+
+    list threshold {
+      key "metric";
+      description "Alarm TmThresholdExceeded is raised when a sample of the metric is
+                   above the limit and cleared when one is back at or below it.";
+      leaf metric {
+        type string;
+        mandatory true;
+      }
+      leaf limit {
+        type decimal64 {
+          fraction-digits 3;
+        }
+        mandatory true;
+      }
+    }
+  }
+}

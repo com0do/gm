@@ -2,19 +2,21 @@ name: Nightly
 
 # ─────────────────────────────────────────────────────────────────────
 # Runs the heavy lanes that PR CI skips: full BUILD_MODE matrix
-# (debug + release + coverage), the lcov coverage flow (Perl deps
+# (debug + release + coverage, plus release under ASan), the lcov coverage flow (Perl deps
 # make it slow to install), a from-scratch `make refresh` on the
 # tip of main, and end-to-end container integration WITHOUT the
 # lane gating (so we notice if anything silently regressed).
 #
-# Trigger: 03:17 UTC daily + manual dispatch.  Late enough that
-# any main-branch push has landed and been mirrored, early enough
-# that the artefacts are ready before the working day.
+# Trigger: manual dispatch, PR label `run-nightly`, or an annual cron
+# (03:17 UTC on 1 Jan).  PR CI already covers the fast lanes on every
+# push; this workflow is the slow matrix (coverage, lcov, refresh,
+# container) and only needs to run when someone asks for it or once a
+# year as an environment-drift sanity check.
 # ─────────────────────────────────────────────────────────────────────
 
 on:
   schedule:
-    - cron: '17 3 * * *'
+    - cron: '17 3 1 1 *'
   workflow_dispatch:
   # Also let PRs opt-in via a label -- handy for exercising the full
   # matrix when a change looks risky.
@@ -56,12 +58,12 @@ jobs:
           esac
 
   # ═════════════════════════════════════════════════════════════════
-  # full-matrix: every BUILD_MODE, every OS family.  Any breakage
-  # here is either a regression or an environment-shift (e.g. Rocky
-  # 8 EOL).
+  # full-matrix: every BUILD_MODE on Rocky 8 (EOL compat) and Rocky 9
+  # (production parity).  PR CI tracks Rocky 9; nightly keeps Rocky 8
+  # so we notice glibc / RPM drift before it surprises users.
   # ═════════════════════════════════════════════════════════════════
   full-matrix:
-    name: Build/test (${{ matrix.mode }} on ${{ matrix.os }})
+    name: Build/test (${{ matrix.lane }} on ${{ matrix.image }})
     needs: guard
     if: needs.guard.outputs.go == 'true'
     runs-on: ubuntu-latest
@@ -69,39 +71,51 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        mode: [debug, release, coverage]
-        os:   [rockylinux:8, rockylinux:9]
+        # lanes, not BUILD_MODEs: release-asan = release flags under ASan
+        lane: [debug, release, release-asan, coverage]
+        image: [rockylinux:8, rockylinux:9]
     container:
-      image: ${{ matrix.os }}
+      image: ${{ matrix.image }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
 
+      - name: Matrix labels (slug for artefact names -- ':' is illegal)
+        id: matrix
+        shell: bash
+        run: echo "slug=${IMAGE//:/-}" >> "$GITHUB_OUTPUT"
+        env:
+          IMAGE: ${{ matrix.image }}
+
       - name: Set up gm environment
+        id: gm-env
         uses: ./.github/actions/setup-gm-env
         with:
-          build-mode: ${{ matrix.mode }}
-          install-coverage: ${{ matrix.mode == 'coverage' && 'true' || 'false' }}
+          build-mode: ${{ matrix.lane }}
+          install-coverage: ${{ matrix.lane == 'coverage' && 'true' || 'false' }}
+          sanitize: ${{ matrix.lane == 'release-asan' && 'address' || '' }}
 
       - name: Full build + tests
-        # BUILD_MODE=coverage uses the coverage.mk pipeline (`make
-        # coverage`), the other two use plain `make all` + `make test`.
         run: |
           set -euo pipefail
-          if [ "${{ matrix.mode }}" = "coverage" ]; then
-            export PATH="$HOME/.local/bin:$PATH"
-            make coverage
-            # And lcov fallback (TODO.md#U6 wants COVERAGE_TOOL=)
-            make coverage-lcov || echo "lcov fallback failed (non-fatal)"
-          else
-            make BUILD_MODE=${{ matrix.mode }} all
-            make BUILD_MODE=${{ matrix.mode }} test
-          fi
+          case "${{ matrix.lane }}" in
+            coverage)
+              export PATH="$HOME/.local/bin:$PATH"
+              make coverage
+              # lcov fallback (TODO.md#U6 wants COVERAGE_TOOL=)
+              make coverage-lcov || echo "lcov fallback failed (non-fatal)" ;;
+            release-asan)   # test-asan proves ASan is really active
+              make BUILD_MODE=release SANITIZE=address all
+              make BUILD_MODE=release SANITIZE=address test ;;
+            *)
+              make BUILD_MODE=${{ matrix.lane }} all
+              make BUILD_MODE=${{ matrix.lane }} test ;;
+          esac
 
       - name: Upload artefacts
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
-          name: nightly-${{ matrix.os }}-${{ matrix.mode }}
+          name: nightly-${{ steps.matrix.outputs.slug }}-${{ matrix.lane }}
           path: |
             build/lib/**
             build/exec/**
@@ -110,6 +124,12 @@ jobs:
             build/depend.mk
           retention-days: 14
           if-no-files-found: warn
+
+      - name: Save ccache
+        if: always()
+        uses: ./.github/actions/save-gm-cache
+        with:
+          cache-key: ${{ steps.gm-env.outputs.ccache-key }}
 
   # ═════════════════════════════════════════════════════════════════
   # deps-refresh: exercise the closed-loop `make refresh` starting
@@ -126,7 +146,9 @@ jobs:
       image: rockylinux:8
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
-      - uses: ./.github/actions/setup-gm-env
+      - name: Set up gm environment
+        id: gm-env
+        uses: ./.github/actions/setup-gm-env
 
       - name: "`make distclean && make refresh` on tip"
         run: |
@@ -157,6 +179,12 @@ jobs:
               sys.exit(1)
           print(f"✅ every one of {len(all_t)} targets has a dep.json entry")
           PY
+
+      - name: Save ccache
+        if: always()
+        uses: ./.github/actions/save-gm-cache
+        with:
+          cache-key: ${{ steps.gm-env.outputs.ccache-key }}
 
   # ═════════════════════════════════════════════════════════════════
   # container-integration: heavy end-to-end.  A full docker build

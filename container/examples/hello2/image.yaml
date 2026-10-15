@@ -13,11 +13,11 @@ install:
 # Consume a gm-built RPM by staging it into extras[].  This is what
 # makes the DAG cross the gm↔container boundary: the container's
 # dep.json now references a gm-managed .rpm; a change to any source
-# that libt2 pulls in propagates: t2.cxx -> libt2.so -> pkg-p2.rpm ->
-# hello2 image.
+# that libtmstats pulls in propagates: summary.cxx -> libtmstats.so ->
+# pkg-tmd.rpm -> hello2 image.
 extras:
-  - src: '../../../build/pkg/rhlinux/debug/pkg-p2-1.0-1.el8.x86_64.rpm'
-    dst: pkg-p2.rpm
+  - src: '../../../build/pkg/rhlinux/debug/pkg-tmd-1.4.0-1.el8.x86_64.rpm'
+    dst: pkg-tmd.rpm
 
 extra:
   docker_source_path: ./examples/hello2/

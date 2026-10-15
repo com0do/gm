@@ -31,10 +31,10 @@ target.go.mk, so dep_query.py handles Java targets uniformly:
     {
       "file": "/abs/path/to/build/java/<target>.jar",
       "deps": [
-        "/abs/path/to/example/j1/src/com/example/j1/Foo.java",
-        "/abs/path/to/example/j1/src/com/example/j1/Bar.java",
-        "/abs/path/to/example/j2/src/com/example/j2/Main.java",
-        "/abs/path/to/build/java/j1.jar"     # if declared via --intree-jar
+        "/abs/path/to/example/dashboard/view/com/example/tm/view/App.java",
+        "/abs/path/to/example/dashboard/api/com/example/tm/api/Metric.java",
+        "/abs/path/to/example/dashboard/api/com/example/tm/api/PromReader.java",
+        "/abs/path/to/build/java/tmapi.jar"     # if declared via --intree-jar
       ]
     }
 
@@ -104,9 +104,9 @@ class ClassIndex:
     """FQCN -> abs source-file path, and package -> {class paths}."""
 
     def __init__(self):
-        # FQCN key like "com.example.j1.Foo"
+        # FQCN key like "com.example.tm.api.Metric"
         self.by_class: dict[str, Path] = {}
-        # Package key like "com.example.j1" → list of files in that pkg
+        # Package key like "com.example.tm.api" → list of files in that pkg
         self.by_package: dict[str, list[Path]] = {}
         # Reverse lookup: source-file → FQCN (used when we want to
         # know the "home package" of a target source).
@@ -213,7 +213,7 @@ def resolve_deps(
 # CLI
 # ─────────────────────────────────────────────────────────────────────
 def parse_intree_jar(spec: str) -> tuple[str, Path]:
-    """`--intree-jar name=/abs/path/j1.jar` -> ('name', Path)."""
+    """`--intree-jar name=/abs/path/tmapi.jar` -> ('name', Path)."""
     if "=" not in spec:
         raise argparse.ArgumentTypeError(
             f"--intree-jar expects NAME=PATH, got {spec!r}")
@@ -243,7 +243,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     p.add_argument("--intree-jar", action="append", default=[], metavar="NAME=PATH",
                    help="add another gm target's .jar as a dep entry, "
                         "even though it isn't a .java file (repeatable). "
-                        "This is how `JAR_DEPS := j1` in target.java.mk "
+                        "This is how `JAR_DEPS := tmapi` in target.java.mk "
                         "propagates the compile-time classpath into "
                         "dep.json.")
     p.add_argument("--include-unresolved", action="store_true",

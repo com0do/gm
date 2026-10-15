@@ -20,7 +20,7 @@ build-time policy in `production/make/scripts/pkgdeps.py::_abs()` --
 emit fast + minimal, resolve symlinks (`readlink -f` /
 `os.path.realpath`) at load/aggregation time in
 `production/tools/pydep/dag.py`.  So the raw sidecars may show
-OUT_DIR-view paths (`build/lib/…/libt2.so`), and consumers that go
+OUT_DIR-view paths (`build/lib/…/libtmstats.so`), and consumers that go
 through DepGraph.load() see the resolved BUILD_DIR forms.
 
 `deps` is built from four sources, all abspath'd then deduped and

@@ -1,6 +1,0 @@
-
-CCFLAGS   += -DBASE64_WITH_INITIALIZATION
-
-CXXSOURCE += t2.cxx
-
-LDFLAGS   += -L$(PROJ_TOP)/tools/rhlinux/usr/lib64

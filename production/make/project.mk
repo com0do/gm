@@ -1,35 +1,52 @@
 # SPDX-License-Identifier: MIT
 #
-# project.mk -- target discovery + implicit lib-level dependency derivation.  Walks
-# $(SOURCE_ROOTS) for *.mk files, classifies each by name+siblings,
-# and generates depend.mk via DRY_RUN sub-makes.
+# project.mk -- target discovery.  Walks $(SOURCE_ROOTS) for *.mk files and classifies each
+# by name+siblings; graph.mk derives the dependency graph between them.
 
 
 # User's top-level Makefile can `SOURCE_ROOTS += <extra-dir>` BEFORE the
 # `include project.mk` line to scan more; we use `?=` so that assignment takes precedence.
-SOURCE_ROOTS ?= $(PROJ_TOP) $(PROJ_TOP)/production/tools/gtest-1.14.0
+SOURCE_ROOTS ?= $(PROJ_TOP) $(ADMIN_DIR)/tools/gtest-1.14.0
 EXCLUDE_DIR  ?= build .git make production note tools container customization
-rwildcard = $(shell find $(1) $(foreach d,$(EXCLUDE_DIR), -path "*/$(d)" -prune -o) \
+GM_SELF      := $(if $(filter Y,$(SINGLE_REPO)),,$(abspath $(ADMIN_DIR)/..))
+rwildcard = $(shell find $(1) $(if $(GM_SELF),-path "$(GM_SELF)" -prune -o) \
+                  -path "$(abspath $(GM_OUT))" -prune -o \
+                  $(foreach d,$(EXCLUDE_DIR), -path "*/$(d)" -prune -o) \
                   -type f $(foreach ext,$(2),-name "$(ext)") -print 2>/dev/null)
 TARGET_ALL_MK := $(strip $(sort $(foreach r,$(SOURCE_ROOTS),$(call rwildcard,$r,*.mk))))
-_TARGET_NAME_FROM_MK = $(patsubst %.import,%,$(basename $(notdir $(1))))
+_TARGET_NAME_FROM_MK = $(patsubst %.java,%,$(patsubst %.import,%,$(basename $(notdir $(1)))))
 TARGET_ALL    := $(foreach mk,$(TARGET_ALL_MK),$(call _TARGET_NAME_FROM_MK,$(mk)))
-_TARGET_DUPES := $(shell printf '%s\n' $(TARGET_ALL) | sort | uniq -d)
+_TARGET_DUPES := $(sort $(foreach t,$(TARGET_ALL),$(if $(word 2,$(filter $(t),$(TARGET_ALL))),$(t))))
 ifneq ($(_TARGET_DUPES),)
 $(error gm: $(_TARGET_DUPES) must be unique.)
 endif
+# gm's own goals.  A target named like one of them (or show-<t> / run-<t> of another target)
+# would be shadowed by it.  _GM_GOALS_ALONE build no target in this make -- they read files, or
+# start a make of their own -- so this make loads no dependency graph for them (graph.mk).  A
+# new goal goes in one of the two lists; left out of _GM_GOALS_ALONE it gets the graph: always
+# correct, only slower.
+_GM_TYPES       := lib exe test go java pkg import-lib import-exe
+_GM_GOALS_ALONE := clean distclean deps deps-files deps-snap help list run test-list \
+                   coverage coverage-lcov coverage-diff changes changes-since incremental refresh \
+                   precheck prereq
+_GM_GOALS       := all show test compile_commands $(_GM_GOALS_ALONE) $(_GM_TYPES)
+_TARGET_CLASH := $(filter $(_GM_GOALS) $(addprefix show-,$(TARGET_ALL)) $(addprefix run-,$(TARGET_ALL)),$(TARGET_ALL))
+ifneq ($(_TARGET_CLASH),)
+$(error gm: target name(s) $(_TARGET_CLASH) clash with gm's own goals; rename the .mk file(s))
+endif
 
 # System-lib inventory for the opt-in LDLIB_CHECK.  
-_GM_SYS_LIB_PATHS := /usr/lib64 /usr/lib /usr/local/lib64 /usr/local/lib /lib64 /lib
+_GM_SYS_LIB_PATHS := /usr/lib64 /usr/lib /usr/local/lib64 /usr/local/lib /lib64 /lib \
+    $(wildcard /usr/lib/*-linux-gnu /usr/local/lib/*-linux-gnu /lib/*-linux-gnu)
 GM_SYS_LIBS := $(if $(filter 1,$(LDLIB_CHECK)),$(call _SCAN_LIB_DIRS,$(_GM_SYS_LIB_PATHS)))
 
 # $(call _CLASSIFY, <name>, <srcdir>, <mkfile>)
 _CLASSIFY = $(strip \
+    $(if $(filter %.java.mk,$(notdir $(3))),java,\
     $(if $(filter %.import.mk,$(notdir $(3))),$(if $(filter lib%,$(1)),import-lib,import-exe),\
     $(if $(filter test-%,$(1)),test,\
     $(if $(filter lib%,$(1)),lib,\
     $(if $(wildcard $(2)/go.mod),go,\
-    $(if $(shell find $(2) -name '*.java' -print -quit 2>/dev/null),java,\
     $(if $(filter pkg-%,$(1)),pkg,\
     exe)))))))
 
@@ -47,15 +64,36 @@ $(1)_type    := $(call _CLASSIFY,$(1),$(3),$(2))
 $(1)_srcdir  := $(3)
 $(1)_relpath := $(4)
 $(1)_mkfile  := $(2)
-$(1): override TYPE       := $$($(1)_type)
-$(1): override SOURCE_DIR := $(3)
-$(1): override BUILD_DIR  := $(GM_OUT)/$(4)/$(BUILD_ARCH)/$(BUILD_MODE)
-$(1): override OUT_DIR    := $$(call _OUT_DIR_FOR,$$($(1)_type))
-$(1): override REL_DIR    := $(GM_RELEASE_DIR)
+$(1) _info-$(1): override TYPE       := $$($(1)_type)
+$(1) _info-$(1): override SOURCE_DIR := $(3)
+$(1) _info-$(1): override BUILD_DIR  := $(GM_OUT)/$(4)/$(BUILD_ARCH)/$(GM_MODE_DIR)
+$(1) _info-$(1): override OUT_DIR    := $$(call _OUT_DIR_FOR,$$($(1)_type))
+$(1) _info-$(1): override REL_DIR    := $(GM_RELEASE_DIR)
 endef
 
 $(foreach mk,$(TARGET_ALL_MK),$(eval $(call SET_TARGET,$(call _TARGET_NAME_FROM_MK,$(mk)),$(mk),$(abspath $(dir $(mk))),$(patsubst $(PROJ_TOP)/%,%,$(abspath $(dir $(mk)))))))
+
 FILTER_FUNC    = $(sort $(foreach sub,$(TARGET_ALL),$(if $(filter $(1),$($(sub)_type)),$(sub))))
+
+# Toolchain gating, once.  go and java are the only types with an optional toolchain: when its
+# tool is missing the whole type leaves the target set here, so every list derived below (and every
+# flow built on them) never sees it.  (pkg stays: libs need its component header; only its rpm
+# step needs rpmbuild, see target.pkg.mk.)
+_GM_NO_GO     := $(if $(call _have,$(GO)),,$(call FILTER_FUNC,go))
+_GM_NO_JAVA   := $(if $(and $(call _have,$(JAVAC)),$(call _have,$(JAR))),,$(call FILTER_FUNC,java))
+TARGET_ALL    := $(filter-out $(_GM_NO_GO) $(_GM_NO_JAVA),$(TARGET_ALL))
+TARGET_ALL_MK := $(foreach t,$(TARGET_ALL),$($(t)_mkfile))
+
+.PHONY: _skip_go _skip_java $(_GM_NO_GO) $(_GM_NO_JAVA)
+_skip_go:
+	+@$(call V_SKIP,$(_GM_NO_GO)  (go not found))
+_skip_java:
+	+@$(call V_SKIP,$(_GM_NO_JAVA)  (javac/jar not found))
+$(_GM_NO_GO):
+	@$(ECHO) "gm: $@ is not built here: go not found" >&2 ; exit 1
+$(_GM_NO_JAVA):
+	@$(ECHO) "gm: $@ is not built here: javac/jar not found" >&2 ; exit 1
+
 TARGET_LIB        := $(call FILTER_FUNC,lib)
 TARGET_EXE        := $(call FILTER_FUNC,exe)
 TARGET_GO         := $(call FILTER_FUNC,go)
@@ -65,26 +103,50 @@ TARGET_TEST       := $(call FILTER_FUNC,test)
 TARGET_IMPORT_LIB := $(call FILTER_FUNC,import-lib)
 TARGET_IMPORT_EXE := $(call FILTER_FUNC,import-exe)
 
+# The DRY_RUN sub-makes read the target list from a file (env.mk, GM_DRY_VARS_FILE).  Written
+# only when its content changes: the dependency scan re-enters this make once per target.
+_GM_DRY_VARS := TARGET_ALL := $(TARGET_ALL)$(_NL)GM_SYS_LIBS := $(GM_SYS_LIBS)
+ifeq ($(DRY_RUN),1)
+ifneq ($(strip $(file <$(GM_DRY_VARS_FILE))),$(strip $(_GM_DRY_VARS)))
+$(if $(wildcard $(GM_OUT)),,$(shell mkdir -p $(GM_OUT)))
+$(file >$(GM_DRY_VARS_FILE),$(_GM_DRY_VARS))
+endif
+endif
+
 define SET_HEADER_TARGET
 $(1)-header: override TYPE       := pkg
 $(1)-header: override SOURCE_DIR := $$($(1)_srcdir)
-$(1)-header: override BUILD_DIR  := $(GM_OUT)/$$($(1)_relpath)/$(BUILD_ARCH)/$(BUILD_MODE)
+$(1)-header: override BUILD_DIR  := $(GM_OUT)/$$($(1)_relpath)/$(BUILD_ARCH)/$(GM_MODE_DIR)
 $(1)-header: override OUT_DIR    := $(GM_PKG_DIR)
 $(1)-header: override REL_DIR    := $(GM_RELEASE_DIR)
 endef
 $(foreach p,$(TARGET_PKG),$(eval $(call SET_HEADER_TARGET,$(p))))
 
+# rpm's %{?dist} (e.g. ".el8") for the pkg file names (target.pkg.mk).  Cached (_CACHE, env.mk):
+# rpm takes longer to start than the rest of this file to parse.  The "d" keeps an empty dist
+# (Debian / Ubuntu) a non-empty, cacheable value.  The dependency scan (DRY_RUN) names no rpm.
+ifneq ($(and $(TARGET_PKG),$(_GM_RPMBUILD),$(if $(filter 1,$(DRY_RUN)),,y)),)
+_GM_RPM_DIST_RAW_KEY  := $(_GM_RPMBUILD)
+_GM_RPM_DIST_RAW_DEPS := $(_GM_RPMBUILD) $(wildcard /usr/lib/rpm/macros.d/* /etc/rpm/* $(HOME)/.rpmmacros)
+_GM_RPM_DIST_RAW_CMD   = printf 'd%s' "$$(rpm --eval '%{?dist}' 2>/dev/null)"
+$(eval $(call _CACHE,_GM_RPM_DIST_RAW,$(GM_OUT)/.rpm-dist.mk))
+endif
+_GM_RPM_DIST := $(patsubst d%,%,$(_GM_RPM_DIST_RAW))
 
-TARGET_DEP ?= $(GM_DEP_FILE)
-.PRECIOUS: $(TARGET_DEP) $(GM_PKG_OF_FILE)
-.PHONY: help deps deps-files deps-snap list-targets
+
+
+.PHONY: help deps-files deps-snap list show
 
 help:
 	@$(ECHO) 'gm - auto-dep-deduced build framework.  See docs/1-USER_GUIDE.md for the full guide.'
 	@$(ECHO) ''
 	@$(ECHO) '  make                    build every discovered target'
 	@$(ECHO) '  make <target>           build one target'
-	@$(ECHO) '  make list-targets       list all discovered targets'
+	@$(ECHO) '  make list               list all discovered targets'
+	@$(ECHO) '  make show               every target: type, dir, what it depends on (build order)'
+	@$(ECHO) '  make show-<type>        targets of one type (lib exe test go java pkg import-lib import-exe)'
+	@$(ECHO) '  make show-<name>        one target: deps, users, pkgs + what its type knows'
+	@$(ECHO) '  make run                list what make run-<name> can run'
 	@$(ECHO) '  make run-<name>         build + execute an exe / test / go target'
 	@$(ECHO) '  make test               build + run every test-*'
 	@$(ECHO) '  make coverage           gcovr HTML/JSON coverage report'
@@ -99,58 +161,10 @@ help:
 	@$(ECHO) '  V=1                     show raw compile commands'
 	@$(ECHO) '  -jN                     parallel build'
 	@$(ECHO) '  BUILD_MODE=release      release build (default: debug)'
+	@$(ECHO) '  SANITIZE=address       AddressSanitizer on any BUILD_MODE (also undefined, thread)'
+	@$(ECHO) '  COVERAGE=1             gcov instrumentation on any BUILD_MODE (make coverage uses it)'
 	@$(ECHO) '  DEP_TREE=yes            emit .dep.json sidecars for file-level DAG'
 
-
-ifneq ($(DRY_RUN),1)
-ifeq ($(origin _DEP_DIGEST_NOW),undefined)
-_DEP_DIGEST_NOW := $(shell echo $(sort $(TARGET_ALL_MK)) | md5sum | cut -c1-32)
-endif
-
-# DRY_RUN scan is intentionally serial + strictly ordered:
-#   1. imports FIRST -- write IMPORT_OF_<artefact> := <mk> into
-#      $(GM_IMPORT_OF_FILE).  Pkgs need this map to resolve
-#      multi-artefact vendor products (pkg.yaml referencing e.g.
-#      libvlib_extra.so where the .mk basename is libvlib).
-#   2. pkgs SECOND -- read IMPORT_OF_*, write PKG_OF_<lib> := <pkg>
-#      into $(GM_PKG_OF_FILE).
-#   3. everything else THIRD -- reads both maps to fill in reverse deps.
-#
-# Serial (not -j) because every DRY_RUN sub-make does `sed -i` on the
-# SHARED depend.mk / pkg_of.mk / import_of.mk files; parallel sed on
-# one file races and drops DAG edges.  See docs/4-DEBUGGING.md.
-$(GM_PKG_OF_FILE):    $(TARGET_DEP) ;
-$(GM_IMPORT_OF_FILE): $(TARGET_DEP) ;
-$(TARGET_DEP): _CHANGED = $(foreach mk,$?,$(call _TARGET_NAME_FROM_MK,$(mk)))
-$(TARGET_DEP): _IMPORT_ALL = $(TARGET_IMPORT_LIB) $(TARGET_IMPORT_EXE)
-$(TARGET_DEP): _ORDERED = \
-    $(filter $(_IMPORT_ALL),$(_CHANGED)) \
-    $(filter $(TARGET_PKG),$(_CHANGED)) \
-    $(filter-out $(_IMPORT_ALL) $(TARGET_PKG),$(_CHANGED))
-$(TARGET_DEP): $(TARGET_ALL_MK)
-	@mkdir -p $(@D)
-	@$(call V_DEPS,scanning $(words $(_CHANGED)) target(s))
-	@for t in $(_ORDERED) ; do \
-	    $(ECHO) "  DEPS    $$t" ; \
-	    GM_TREE= $(MAKE) -s DRY_RUN=1 $$t || exit $$? ; \
-	 done
-	@# Drop target.dry-run.mk's seed blank line, sort + dedupe.
-	@sort -u $(GM_PKG_OF_FILE) | grep -v '^[[:space:]]*$$' \
-	   > $(GM_PKG_OF_FILE).tmp && mv $(GM_PKG_OF_FILE).tmp $(GM_PKG_OF_FILE) || true
-	@sort -u $(GM_IMPORT_OF_FILE) | grep -v '^[[:space:]]*$$' \
-	   > $(GM_IMPORT_OF_FILE).tmp && mv $(GM_IMPORT_OF_FILE).tmp $(GM_IMPORT_OF_FILE) || true
-	@{ echo '_DEP_DIGEST := $(_DEP_DIGEST_NOW)' ; \
-	   grep -Ev '^(_DEP_DIGEST := |[[:space:]]*$$)' $(TARGET_DEP) | sort -u ; } \
-	   > $(TARGET_DEP).tmp && mv $(TARGET_DEP).tmp $(TARGET_DEP)
-	@$(call V_DEPS,-> $(patsubst $(PROJ_TOP)/%,%,$(TARGET_DEP)) ($$(($$(wc -l < $(TARGET_DEP)) - 1)) edges))
-	@$(call V_DEPS,-> $(patsubst $(PROJ_TOP)/%,%,$(GM_PKG_OF_FILE)) ($$(wc -l < $(GM_PKG_OF_FILE)) pkg-of mappings))
-	@$(call V_DEPS,-> $(patsubst $(PROJ_TOP)/%,%,$(GM_IMPORT_OF_FILE)) ($$(wc -l < $(GM_IMPORT_OF_FILE)) import-of mappings))
-
-deps:
-	@$(RM) $(TARGET_DEP) $(GM_PKG_OF_FILE) $(GM_IMPORT_OF_FILE)
-	@GM_TREE= $(MAKE) $(TARGET_DEP)
-
-endif # DRY_RUN != 1
 
 deps-files:
 	@python3 $(ADMIN_DIR)/make/scripts/dep_query.py \
@@ -164,14 +178,43 @@ deps-snap: $(GM_FRAMEWORK_JSON)
 	    snapshot --out-dir $(GM_OUT)/deps \
 	    $(if $(VERSION),--version '$(VERSION)')
 
-list-targets:
+list:
 	@printf '%s\n' $(TARGET_ALL)
 
-_RUN_TARGETS := $(patsubst %,run-%,$(TARGET_EXE) $(TARGET_TEST) $(TARGET_GO) $(TARGET_IMPORT_EXE))
-.PHONY: $(_RUN_TARGETS)
-$(_RUN_TARGETS): run-%: %
+# What gm derived: `make show` (every target: type, dir, direct deps, build order),
+# `make show-<type>` (the targets of one type, with what that type knows: output, sources, rpm,
+# ...) and `make show-<name>` (one target: deps, transitive deps, users, pkgs, type facts).  The
+# type facts come from the target's own sub-make (`_gm_show`, target.common.mk), one file per
+# target under $(GM_OUT)/.show; the target table goes through a file too (a command line would
+# not hold a large tree).
+_SHOW_ALL   := $(TARGET_ALL) $(_GM_NO_GO) $(_GM_NO_JAVA)
+_SHOW_GOALS := $(addprefix show-,$(_SHOW_ALL) $(_GM_TYPES))
+_SHOW_META  := $(GM_OUT)/.targets.meta
+_SHOW_INFO  := $(GM_OUT)/.show
+.PHONY: show $(_SHOW_GOALS) $(addprefix _info-,$(TARGET_ALL))
+$(addprefix _info-,$(TARGET_ALL)): _info-%: | $(GM_OUT)
+	@mkdir -p $(_SHOW_INFO) && $(call _GM_SUBMAKE,$*,-s _gm_show) > $(_SHOW_INFO)/$*
+$(foreach t,$(TARGET_ALL),$(eval show-$(t): _info-$(t)))
+$(foreach y,$(_GM_TYPES),$(eval show-$(y): $(addprefix _info-,$(call FILTER_FUNC,$(y)))))
+# Written once per make, whatever number of show goals run in parallel.
+$(_SHOW_META): _gm_force | $(GM_OUT)
+	$(file >$@,$(foreach t,$(_SHOW_ALL),$(t)|$($(t)_type)|$($(t)_relpath)|$(patsubst $(PROJ_TOP)/%,%,$($(t)_mkfile))|$(if $(filter $(t),$(_GM_NO_GO)),go not found,$(if $(filter $(t),$(_GM_NO_JAVA)),javac/jar not found))$(_NL)))
+show $(_SHOW_GOALS): $(_SHOW_META)
+	@python3 $(ADMIN_DIR)/make/scripts/show-targets.py --meta $(_SHOW_META) --depend $(TARGET_DEP) \
+	    --pkg-of $(GM_PKG_OF_FILE) --info-dir $(_SHOW_INFO) \
+	    $(if $(filter $(patsubst show-%,%,$@),$(_GM_TYPES)),--type $(patsubst show-%,%,$@),$(patsubst show-%,%,$(filter-out show,$@)))
+
+_RUNNABLE := $(sort $(TARGET_EXE) $(TARGET_TEST) $(TARGET_GO) $(TARGET_IMPORT_EXE))
+.PHONY: run $(addprefix run-,$(_RUNNABLE))
+$(addprefix run-,$(_RUNNABLE)): run-%: %
 	@$(ECHO) "  RUN     $*"
 	@"$(GM_EXEC_DIR)/$*" $(RUN_ARGS)
+# Not "run them all": exes are servers, daemons, tools that need arguments -- only tests are
+# self-checking (make test).
+run:
+	@$(ECHO) 'make run-<name> [RUN_ARGS=...] builds and runs one of:'
+	@printf '  %s\n' $(_RUNNABLE)
+	@$(ECHO) 'make test [TESTS=...] runs the tests and checks they pass.'
 
 # compile_commands.json
 GM_CDB       := $(GM_OUT)/compile_commands.json
@@ -179,8 +222,11 @@ GM_CDB_LINK  := $(PROJ_TOP)/compile_commands.json
 _CDB_TARGETS := $(TARGET_LIB) $(TARGET_EXE) $(TARGET_TEST) $(TARGET_PKG)
 .PHONY: compile_commands
 compile_commands: $(GM_CDB)
+# The targets are phony, so this recipe always runs; the script tells whether the DB is stale.
+# Under make -q that answer is the result: `+` runs the line even in question mode.
 $(GM_CDB): $(_CDB_TARGETS) | $(GM_OUT)
-	@bash $(ADMIN_DIR)/make/scripts/cdb-aggregate.sh $(GM_OUT) $@ $(GM_CDB_LINK) $(PROJ_TOP)
+	$(if $(_GM_MAKE_Q),+)@bash $(ADMIN_DIR)/make/scripts/cdb-aggregate.sh $(if $(_GM_MAKE_Q),--check) \
+	    $(GM_OUT) $@ $(GM_CDB_LINK) $(PROJ_TOP)
 $(GM_OUT):
 	@mkdir -p $@
 

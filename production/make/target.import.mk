@@ -10,8 +10,8 @@
 # separated).  The recipe that BUILDS them is on the user -- typically
 # `$(MAKE) -C vendor` or `cmake --build vendor/build`.  Treat vendor
 # as a BLACK BOX; don't enumerate its sources for gm mtime tracking.
-# See third_party/vlib (mixed: libvlib.so + libvlib_extra.so) and
-# third_party/vtool (exe).
+# See third_party/minijson (mixed: libminijson.so / .a, libminijson_file.so, the jsonpp
+# tool) and third_party/loadgen (exe).
 #
 # Per-artefact routing (below): `.so` / `.a` -> $(GM_LIB_DIR), else
 # -> $(GM_EXEC_DIR).  One .mk can freely mix libs + exes; the
@@ -28,6 +28,18 @@ MAKEFILE     := $(lastword $(filter-out $(ADMIN_DIR)/make/% ,$(abspath $(MAKEFIL
 TARGET       := $(patsubst %.import,%,$(basename $(notdir $(MAKEFILE))))
 MAKEFILE_DIR := $(abspath $(dir $(MAKEFILE)))
 include $(ADMIN_DIR)/make/target.common.mk
+
+# The vendor's own make (`$(MAKE) -C $(VENDOR)` in the .import.mk) must not inherit gm's
+# sub-make variables: BUILD_DIR / TYPE / PROJ_TOP / ... would override the vendor's variables of
+# the same name.  Command-line variables reach a child make twice -- in MAKEFLAGS and in its
+# environment -- so both are cut.  The user's own command-line variables still pass.
+MAKEOVERRIDES := $(filter-out $(addsuffix =%,$(_GM_SUBMAKE_VARS)),$(MAKEOVERRIDES))
+unexport $(_GM_SUBMAKE_VARS)
+# It does get gm's compilers, as CC / CXX in its environment: a vendor `CC ?= gcc` (or none)
+# builds with the same compiler as the rest of the tree, a vendor `CC := ...` keeps its own.
+# A `make CC=...` typed by the user still reaches it on the command line.
+export CC  := $(C_PATH)
+export CXX := $(CC_PATH)
 
 _IMPORT_NAME = $(strip $(patsubst %.a,%,$(patsubst %.so,%,$(notdir $(1)))))
 _IMPORT_DIR = $(strip \
@@ -54,7 +66,7 @@ endif
 # BLACK BOX (we don't `find` its sources), user declares which
 # directories dep_query.py should treat as "any change under here
 # invalidates my artefact".  Default: $(VENDOR) if set -- that's the
-# convention in third_party/vlib/*.import.mk.  pydep uses filesystem
+# convention in third_party/*/*.import.mk.  pydep uses filesystem
 # `is_dir()` at load time to identify directory deps; trailing `/`
 # is optional (and NOT normalized here).
 IMPORT_SRC_DIRS ?= $(VENDOR)
@@ -105,6 +117,11 @@ $(GM_LIB_DIR) $(GM_EXEC_DIR):
 clean:
 	$(Q)$(RM) $(_TARGET_PATHS) $(DEP_JSON_LINK)
 	$(V_CLEAN)
+
+GM_SHOW_FIELDS := artefacts published vendor
+SHOW_artefacts = $(notdir $(IMPORT_ARTIFACT))
+SHOW_published = $(foreach d,$(sort $(dir $(_TARGET_PATHS))),$(call _rel,$(patsubst %/,%,$(d))))
+SHOW_vendor    = $(or $(call _rel,$(IMPORT_SRC_DIRS)),-)
 
 
 endif # DRY_RUN

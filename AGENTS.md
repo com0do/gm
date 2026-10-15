@@ -88,11 +88,12 @@ The top of `env.mk` is a strict funnel:
 1. Tool paths + `MAKEFLAGS` defence (`--no-builtin-rules`,
    `--no-builtin-variables`)
 2. `BUILD_MODE ?= debug`, `BUILD_ARCH` derivation
-3. **Legality guards** — SUB_TARGET / BUILD_MODE whitelist,
-   `lib*` + `pkg*` goal-mixing refusal, deprecated `o=` alias handling.
+3. **Legality guards** — SUB_TARGET / BUILD_MODE whitelist, `SANITIZE`
+   set validation, `lib*` + `pkg*` goal-mixing refusal, `o=` alias.
    Any invalid input `$(error)`s here.
-4. Only AFTER (3) does env.mk derive `GM_LIB_DIR`, `GM_EXEC_DIR`,
-   `GM_PKG_DIR`, ... from the validated `BUILD_MODE`.
+4. Only AFTER (3) does env.mk derive `GM_MODE_DIR` and from it
+   `GM_LIB_DIR`, `GM_EXEC_DIR`, `GM_PKG_DIR`, ... from the validated
+   `BUILD_MODE` / `SANITIZE`.
 
 An earlier revision had a separate `check.mk` after env.mk;
 that was a bug — a bad `BUILD_MODE` would silently interpolate into
@@ -128,21 +129,24 @@ gm/
 ├── README.md                     # user-facing overview
 ├── do_build.sh                   # smoke build for CI + humans
 │
-├── example/                      # sample targets exercising every type
-│   ├── t1/  t2/                 #   lib (C++ + gtest tests under test/)
-│   ├── t3/                       #   exe
-│   ├── g1/                       #   go
-│   ├── j1/  j2/                 #   java  (j2 depends on j1)
-│   ├── p1/                       #   pkg (plain-mode)
-│   └── p2/                       #   pkg (XML-mode, versionstamp demo)
+├── example/                      # the example product tm (example/README.md maps it)
+│   ├── core/  stats/            #   libtmcore (static C), libtmstats (shared C++), tests under test/
+│   ├── daemon/                   #   tmd (exe), alarms/ (generated lib), deploy/ (pkg-tmd, YAML)
+│   ├── cli/  tmtools/           #   tmctl (C exe), pkg-tm-tools (plain-mode .spec)
+│   ├── sdk/                      #   pkg-tm-devel (YAML, custom filegroups)
+│   ├── exporter/  cgo/          #   go: tmexport, tmcrc (cgo on libtmcore)
+│   ├── dashboard/                #   java: tmapi (library jar), tmview (depends on tmapi)
+│   └── selftest/                 #   test-asan
+├── third_party/                  # libini (gm-compiled), libminijson + loadgen (.import.mk)
 │
 ├── production/                   # THE FRAMEWORK — never scanned as
 │   │                            # user targets (EXCLUDE_DIR).
 │   ├── make/
 │   │   ├── env.mk                # tools + defaults + legality guards +
 │   │   │                        #   GM_OUT layout + framework file list
-│   │   ├── flags.mk              # CFLAGS/CCFLAGS/LDFLAGS accumulators
-│   │   ├── project.mk            # TARGET_ALL discovery, deps rule
+│   │   ├── flags.mk              # CFLAGS/CCFLAGS/LDFLAGS accumulators + compiler selection (CC/CXX/PATH → GM_CC/GM_CXX/GM_LD)
+│   │   ├── project.mk            # TARGET_ALL discovery, gm's goal list
+│   │   ├── graph.mk              # top level: include depend.mk (goals that build), regen rule
 │   │   ├── target.common.mk      # sub-make bootstrap (env.mk include etc.)
 │   │   ├── target.dry-run.mk     # shared DRY_RUN=1 short-circuit
 │   │   ├── target.c.mk           # C/C++ compile + link rules
@@ -169,6 +173,7 @@ gm/
 │   │   ├── dep-hooks.sh          # cp/install hook -> hooks.jsonl
 │   │   │                        #   (used by target.pkg.mk + container/)
 │   │   ├── precheck.sh           # local static-check runner (`make precheck`)
+│   │   ├── gmdbg.py              # `gm core|watch|symbols` (python CLI + gdb-side script)
 │   │   └── gtest-1.14.0/         # vendored gtest as a gm-managed lib
 │   ├── ruff/ruff.toml            # ruff config (not pyproject.toml — gm
 │   │                            #   isn't a Python package)
@@ -200,10 +205,11 @@ Filename convention + sibling-file existence drive classification.  See
 
 | Signal                                         | TYPE  | Recipe file           | Artifact         |
 |------------------------------------------------|-------|-----------------------|------------------|
+| `.java.mk` suffix (`tmapi.java.mk` -> `tmapi`) | java  | target.java.mk        | `.jar`           |
+| `.import.mk` suffix                            | import-lib / import-exe | target.import.mk | vendor artefacts |
 | basename starts with `test-`                   | test  | target.c.mk           | binary + gtest   |
 | basename starts with `lib`                     | lib   | target.c.mk           | `.so` or `.a`    |
 | sibling `go.mod` present                       | go    | target.go.mk          | binary           |
-| any `.java` under the target dir (find -quit)  | java  | target.java.mk        | `.jar`           |
 | basename starts with `pkg-`                    | pkg   | target.pkg.mk         | `.rpm`           |
 | else                                           | exe   | target.c.mk           | binary           |
 
@@ -221,14 +227,14 @@ with a `git mv` suggestion.
 Five contracts key on that one name:
 
 1. dispatcher's sub-make goal (`$(MAKE) ... $(TARGET)`)
-2. `depend.mk`'s line key (`t3: libt1 libt2`)
-3. `pkg_of.mk`'s key (`PKG_OF_libt2 := pkg-p2`)
+2. `depend.mk`'s line key (`tmctl: libtmcore`)
+3. `pkg_of.mk`'s key (`PKG_OF_libtmstats := pkg-tmd pkg-tm-devel`)
 4. `dep_query.py`'s target identity
 5. `TARGET_ALL` — the in-tree-vs-system-lib filter that makes
    automatic `-lfoo` → `libfoo` build-**order** derivation possible
 
 Divergence broke all five.  Observed symptoms before removal:
-`make libt1` → "No rule to make target"; `-lrenamed` silently
+`make libtmcore` → "No rule to make target"; `-lrenamed` silently
 vanishing from depend.mk; go's `BIN_NAME` producing a differently-
 named binary that `PKG_FILES` / dep_query could never resolve
 (go was the nastiest — it did *not* error, just silently diverged).
@@ -257,18 +263,21 @@ sorted by TYPE.  Layout mirrors reg's `ims_do/` tree:
 
 ```
 $(GM_OUT)/
-├── lib/<arch>/<mode>/            libt*.a, libt*.so   (GM_LIB_DIR)
-├── exec/<arch>/<mode>/           exe + go + test    (GM_EXEC_DIR)
-├── pkg/<arch>/<mode>/            *.rpm              (GM_PKG_DIR)
+├── lib/<arch>/<variant>/         libt*.a, libt*.so   (GM_LIB_DIR)
+├── exec/<arch>/<variant>/        exe + go + test    (GM_EXEC_DIR)
+├── pkg/<arch>/<variant>/         *.rpm + *-debuginfo.rpm (GM_PKG_DIR)
 ├── java/                          *.jar              (GM_JAVA_DIR)
 ├── gen/include/<arch>/            generated headers  (GM_GEN_DIR)
 ├── coverage/                      gcovr/lcov output  (GM_COVERAGE_DIR)
 ├── release/                       staged release     (GM_RELEASE_DIR)
 ├── depend.mk                      link-time DAG      (GM_DEP_FILE)
 ├── pkg_of.mk                      pkg-of reverse map (GM_PKG_OF_FILE)
-└── <relpath>/<arch>/<mode>/       per-target intermediates
+└── <relpath>/<arch>/<variant>/    per-target intermediates
                                    (.o, .d, .dep.json, MANIFEST.MF, ...)
 ```
+
+`<variant>` is `GM_MODE_DIR`: the `BUILD_MODE`, plus the sorted `SANITIZE` /
+`COVERAGE` tags when set (`release`, `release-asan-ubsan`, `debug-cov`).
 
 **Rule**: no gm code hard-codes `build/`.  Everything goes through
 `GM_OUT` / `GM_LIB_DIR` / etc.  This lets `make GM_OUT=/tmp/x`
@@ -289,7 +298,7 @@ symlinks).  See target.java.mk's `JAR_OUT` block.
 ## 6. Build flow (top to leaf)
 
 ```
-                       user runs `make libt2`
+                       user runs `make libtmstats`
                                 │
                                 ▼
                     ┌───────────────────────┐
@@ -298,13 +307,13 @@ symlinks).  See target.java.mk's `JAR_OUT` block.
                     │   include env.mk      │──── FAIL-FAST LEGALITY
                     │   include project.mk  │──── TARGET_ALL discovery
                     │   include incr/cov/…  │
-                    │   -include depend.mk  │──── pre-built lib-level DAG
+                    │   include graph.mk    │──── depend.mk, if a goal builds
                     └──────────┬────────────┘
                                │
                     ┌──────────▼────────────┐
                     │ $(TARGET_ALL) rule    │
                     │   dispatch by TYPE    │──── $(MAKE) -C <srcdir>
-                    │   forwards            │       -f libt2.mk
+                    │   forwards            │       -f libtmstats.mk
                     │   BUILD_DIR/OUT_DIR/  │       -f target.c.mk
                     │   TYPE/SUB_TARGET     │       BUILD_DIR=... TYPE=lib
                     │   to the sub-make     │       $(SUB_TARGET)
@@ -341,6 +350,133 @@ $(TARGET_ALL):
 Everything else is set-up (`env.mk`, `project.mk`, ...) or per-type
 recipes (`target.*.mk`).
 
+### 6.1 Compiler, sanitizer and debuginfo choices
+
+- **Compiler selection** (`flags.mk`).  `CC` / `CXX` (env or cmdline), else
+  `gcc` / `g++` on `PATH`, found by a pure-make scan of `PATH` (ccache shim
+  dirs skipped).  `C_PATH` / `CC_PATH` / `LD_PATH` are gm-internal results, not
+  knobs, and not exported: env, cmdline (via `MAKEFLAGS`) and `PATH` reach every
+  sub-make, so each one resolves the same compilers.  gm's own command lines are
+  `GM_CC` / `GM_CXX` / `GM_LD`: gm used to assign `CC` / `C` / `LD` itself
+  (`CC` meaning "C++ with ccache"), which clobbered the standard variable
+  and polluted what vendor builds (`CC ?= gcc`) and cgo inherit.  Never
+  assign `CC` / `CXX` in the framework.
+- **Robustness rules in the make layer.**  Target names are `.PHONY` (a same-named dir
+  would otherwise make a leaf target a silent no-op).  `.DELETE_ON_ERROR` is on and `.d`
+  files are written to `.tmp`, installed only when non-empty.  Values that reach a shell go
+  through `$(call _sq,..)` (env.mk), never inside hand-written `'...'`: flags with quotes broke
+  the flag stamps and the compile database.  compile_commands fragments are written with `jq`
+  behind `GM_JQ` (one probe in env.mk): without jq there is no compile database, the build is
+  unaffected.  Sub-goals listed in `SUB_TARGET_ALONE` (env.mk, today `clean`) skip the dependency
+  edges, so `clean` cleans one target; a sub-goal not listed gets the full `depend.mk`.
+- **Dependency graph loading (graph.mk).**  make remakes every makefile it includes before it
+  looks at a goal, so an included `depend.mk` scans the tree whenever it is stale, whatever the
+  goal.  graph.mk includes it in the top-level make only when a goal builds targets there; the
+  goals that build none are `_GM_GOALS_ALONE` in project.mk (they read files, or start a make of
+  their own).  A new gm goal goes in `_GM_GOALS_ALONE` or the other half of `_GM_GOALS` -- the
+  list every goal is already in for the name-clash check -- never behind its own
+  `ifneq ($(MAKECMDGOALS),...)`.  Unlisted goals (targets, `run-<t>`, a project's own) get the
+  graph: correct by default.  The top level never reads `pkg_of.mk` / `import_of.mk`: only
+  target sub-makes do (env.mk `-include`s them there, read only, before the target's .mk), so
+  nothing but `depend.mk` drives the scan.  Check 17 leg P: `make help/list/prereq/clean` on an
+  empty tree start no scan.  A scan never records a graph it could not compute: a YAML pkg whose
+  pkg.yaml cannot be read (no PyYAML) stops it (target.pkg.mk), and a failed scan removes
+  `depend.mk` -- its sub-makes update it as they go, and a half-updated file newer than every
+  `.mk` would look current (leg Q).  Likewise no `find` stops make at the probe (env.mk) instead of
+  discovering an empty tree (leg R).
+  Toolchain gating happens once, in project.mk, on two inputs: no `go` drops every go target,
+  no `javac`/`jar` drops every java target.  They leave `TARGET_ALL` (and `TARGET_ALL_MK`)
+  before `TARGET_LIB/EXE/GO/...` are derived, so no later flow filters.  The two lists
+  (`_GM_NO_GO`, `_GM_NO_JAVA`) each have a virtual target (`_skip_go`, `_skip_java`) that `all`
+  lists when non-empty, printing one `SKIP` line per toolchain; naming a skipped target fails
+  with "not built here".  pkg targets stay (libs
+  need their component.h); target.pkg.mk skips only the rpm step when rpmbuild is missing.
+  There is deliberately no tree lock: one make per tree.  Check 17 in precheck pins these.
+- **Inputs are declared, not searched.**  A target's inputs come from its `.mk`: sources
+  (`CXXSOURCE` / `CSOURCE`), generated-header templates (`HEADER_GEN`), libs (`LDLIBS`).  `find`
+  during a build would pick up files a user keeps around but does not use yet (a draft `.h.in`
+  became a header nobody asked for) and costs a fork per target.  `find` is for discovering
+  targets (the `*.mk` scan) and for the build's own outputs (`*.cc.json`, `*.gcda`, lib
+  lookup).  Java follows the same rule: a java target is a `<name>.java.mk` and lists its
+  `JAVASOURCE` (no "any `.java` below" classification, no default glob).  depjava.py's class
+  index still walks `JAVA_SRC_ROOTS` (DEP_TREE only): it maps imports to the files of OTHER
+  targets, whose JAVASOURCE a sub-make does not see.
+- **No-op cost.**  A sub-make runs once per target per `make`, so nothing in its parse path may
+  fork per target what is the same for the whole tree: host probes (`go javac jar jq ccache
+  rpmbuild`, `uname -m`, hostname, the commit time) run in ONE shell in the top-level make
+  (env.mk, `GM_TREE` still empty) and are exported.  Values that only change with their inputs
+  go through `_CACHE` (env.mk: a makefile under BUILD_DIR / GM_OUT, rebuilt when a dependency is
+  newer or its key differs, make then restarts): `go list`, the pkg.yaml in-tree list, rpm's
+  `%{?dist}`.  Flag stamps (`_FLAG_STAMP`) compare at parse time with `$(file <)` and only get a
+  rule when the flags changed.  Recursive (`=` / `?=`) variables holding `$(shell)` re-run it at
+  every reference -- and an exported one at every recipe line: compute once with `:=`.
+  Check 17 leg L fails if a no-op build starts python or rpm.
+- **Introspection.**  `make show` (table from project.mk's variables + depend.mk, no sub-make),
+  `make show-<type>` / `show-<name>` (adds the type's facts: each target's sub-make runs the
+  `_gm_show` goal of target.common.mk, which prints `GM_SHOW_FIELDS` / `SHOW_<field>` set at the
+  end of every target.<type>.mk -- a new type sets its own).  `show-<t>` depends on `_info-<t>`,
+  whose recipe runs `<t>`'s sub-make with the goal `_gm_show` into `$(GM_OUT)/.show/<t>`.  Every
+  sub-make (dispatch, `<pkg>-header`, `_info-<t>`) is `$(call _GM_SUBMAKE,<target>,<goal>)`
+  (Makefile); its TYPE / SOURCE_DIR / BUILD_DIR / OUT_DIR / REL_DIR are the target-specific
+  values SET_TARGET (for `<t>` and `_info-<t>`) and SET_HEADER_TARGET (for `<pkg>-header`) set.
+  `make run` only lists `run-<name>` targets on purpose: exes may be servers or need arguments;
+  tests are the self-checking ones (`make test`).
+- **Layout.**  `SINGLE_REPO` (env.mk, default `Y`): gm is vendored, make runs in the project and
+  `ADMIN_DIR=$(PROJ_TOP)/production`.  `N`: gm is a checkout next to the project repo(s), make
+  runs in the gm checkout, `PROJ_TOP` is its parent and `ADMIN_DIR=$(CURDIR)/production`;
+  project.mk prunes the gm checkout (`GM_SELF`) from the `*.mk` scan so gm's `example/` is not a
+  target, and the gtest root comes from `ADMIN_DIR`.  The `gm` wrapper (`production/tools/gm`)
+  makes both layouts usable from any directory: a marker tree above CWD wins (layout Y), else
+  with `SINGLE_REPO=N` exported it uses the checkout it lives in (found through its symlink);
+  it passes `SINGLE_REPO` explicitly and turns `gm changes` paths into absolute ones.  Object
+  `.dep.json` sidecars store absolute paths (relative `.d` entries are resolved against the
+  source dir), so a target's own sources are matched by `make changes`.  Check 17 leg J pins it.
+- **Flags and reproducibility.**  flags.mk carries no product-specific flags; a project sets
+  `PROJECT_CPPFLAGS / _CFLAGS / _CCFLAGS / _LDFLAGS` (and `WARN_LEVEL`, `HARDEN`, `CXX_STD`,
+  `PATH_MAP`) in its top-level Makefile -- flags.mk exports them at its end (exporting earlier
+  would define an unset `?=` knob as empty) and the sub-makes read the environment.  `-m64`
+  depends on `GM_MACHINE` (`gcc -dumpmachine`, found once at the top level, passed down).
+  `-ffile-prefix-map=<PROJ_TOP>=.` (+ `GM_OUT`, + `ADMIN_DIR` when outside) keeps the checkout
+  directory out of binaries; off for coverage (gcov needs real paths).  Go adds `-ldflags=-buildid=`
+  (its id hashes the cgo flags); the versionstamp's time follows SOURCE_DATE_EPOCH; `BUILD_HOST`
+  feeds headers, versionstamp and rpm `_buildhost`; a `%ghost` file is created empty in the
+  buildroot (a missing one makes rpm store a buildroot path).  Verified by hashing the same tree
+  built under two paths and two hostnames (Rocky 8 / 9, Ubuntu 24.04) and by check 17.
+- **Debug tools** (`production/tools/gmdbg.py`, dispatched by `tools/gm`).
+  One file, two roles: under python it is the CLI; `gdb -x gmdbg.py` runs the
+  gdb side (config in `$GMDBG_CFG`, report on a private fd so gdb's chatter
+  stays out of the terminal; `_run_gdb` drains the rest and prints it only on
+  failure or `-v`).  It never edits the target and never replaces gdb: `watch`
+  arms `gdb.Breakpoint` hardware watchpoints and refuses a software fallback,
+  `--kernel` is a `catch syscall` whose condition is a gdb convenience function
+  (`$_gm_kw`) that reports from inside the condition and returns 0, so gdb keeps
+  resuming.  Fatal signals are passed to the target.  Classification in
+  `_classify` is plain pattern matching over (signal, frame names, instruction,
+  registers); keep it a pure function.  gdb 8.2 is the floor (no
+  `Inferior.architecture`).  `_find_gdb` probes gdb's Python (importing what the script
+  imports) and, on failure, retries without `LD_LIBRARY_PATH` / `PYTHONHOME` / `PYTHONPATH`,
+  handing them to a launched target via `set environment`.  Nothing here touches the build; `note/memwatch.*`
+  is someone else's older tool and is not part of gm.
+- **Instrumentation axes** (`SANITIZE`, `COVERAGE`).  Axes next to
+  `BUILD_MODE`, not modes (coverage used to be one; it inherited debug's flags
+  and could not be combined or placed on release):
+  `env.mk` parses and validates them and derives `GM_MODE_DIR`; `flags.mk` adds
+  the flags at compile and link; `target.go.mk` feeds them to cgo (+ `-asan`);
+  `target.pkg.mk` tags the RPM release and adds the runtime `Requires:`.
+  `component.h` is generated with the *untagged* release because
+  `GM_GEN_DIR` is shared by all variants.  `coverage.mk` rebuilds with
+  `COVERAGE=1`, runs the exes, then `make test`.  Guide: USER_GUIDE 3.12.
+- **Link and reproducibility** (USER_GUIDE 3.14 / 3.15).  Exes get an
+  `$ORIGIN`-relative RPATH (`_GM_RPATH_LIB`, target.common.mk); packaging
+  repoints it with `elf-rpath.py` (spec `%install`, generated and plain mode
+  alike).  `SOURCE_DATE_EPOCH` is exported by env.mk and consumed by `ar -D`,
+  `jar-normalize.py`, rpmbuild (`clamp_mtime…`, `use_source_date_epoch_as_buildtime`,
+  `%__strip` = `strip-deterministic`) and pkg-build.py.
+- **Debuginfo** (`pkg-debuginfo.spec.inc`).  Every mode compiles with `-g`
+  and links with `--build-id`; the generated spec and plain-mode specs both
+  get `%debug_package`, and `target.pkg.mk` publishes the resulting
+  `<pkg>-debuginfo` RPM next to the package.  Guide: USER_GUIDE 3.13.
+
 ---
 
 ## 7. Link-time DAG — depend.mk
@@ -348,15 +484,16 @@ recipes (`target.*.mk`).
 `$(GM_OUT)/depend.mk` holds one line per target:
 
 ```
-libt2:pkg-p2-header
-pkg-p1:libt2 t3
-t3:libt1 libt2 pkg-p2-header
-test-t2:libt2 libgtest libgtest_main pkg-p2-header
+libtmstats:libtmcore pkg-tmd-header pkg-tm-devel-header
+pkg-tmd:tmd libtmstats libminijson
+tmd:libtmcore libtmalarms libtmstats libini libminijson pkg-tmd-header
+test-tmstats:libtmstats libgtest libgtest_main
 ```
 
 Each line is a plain make rule: `<target>: <its intree prereqs>`.
-`-include`'d from the top Makefile, so `make t3` on a cold clone
-naturally builds `libt1 libt2 pkg-p2-header` first.
+Included by graph.mk in the top-level make for a goal that builds
+targets, so `make tmd` on a cold clone naturally builds
+its libraries and `pkg-tmd-header` first.
 
 ### How it's derived: DRY_RUN sub-makes
 
@@ -416,10 +553,19 @@ invalidate this artefact (see §10).
 | Type   | Emitter                                                      |
 |--------|--------------------------------------------------------------|
 | C/C++  | `link_dep_json.jq` — union of per-obj deps + `-lXXX` resolutions + framework |
-| Go     | `depgo.sh` — `go list -deps` walk + framework post-processing (jq) |
+| Go     | `depgo.sh` — `go list -deps` walk; a jq post-pass adds the in-tree C libraries cgo links (`LDLIBS`), the `.mk` and the framework |
 | Java   | `depjava.py` — import + package-graph walker + `--intree-jar` (there's no `go list` for java, so we parse imports ourselves) |
 | Pkg    | `pkgdeps.py` — hooks.jsonl (plain mode) or rpmbuild log (XML mode) + framework via `--extra-dep` |
 | Image  | `container/` — see §11                                        |
+
+**A generated file is an artefact too.**  Objects list the generated headers / sources they
+compile (from `.d`), but nothing says what those were generated from -- so a walk from
+`pkg.yaml` used to stop at the pkg.  The rule that generates a file therefore writes its
+dep.json: `component.h.dep.json` (target.pkg.mk: pkg.yaml, the pkg's `.mk`, pkg-build.py) and
+`alarms.{h,cxx}.dep.json` (_pkg_alarm.mk, registered through `_GM_GEN_DEP_JSON`).  pydep
+classifies `.h` / `.c` / `.cxx` ... artefacts as `gen`: they carry edges, they are not targets.
+`HEADER_GEN` templates need no file of their own: link_dep_json.jq lists the `.h.in` directly.
+A new generator writes its outputs' dep.json the same way (check 17 leg S).
 
 ### The query interface: `dep_query.py`
 
@@ -470,82 +616,63 @@ mechanisms coexist:
 
 ### 9.1 Explicit cmdline forwarding (dispatcher)
 
-`$(TARGET_ALL)` dispatcher recipe:
+Every target sub-make (dispatch, `<pkg>-header`, `_info-<t>`) is one macro (top-level
+`Makefile`):
 
 ```make
-$(MAKE) -C $(SOURCE_DIR) -f $@.mk -f $(call TARGET_RULES_FOR,$(TYPE)) \
-    BUILD_DIR='$(BUILD_DIR)' OUT_DIR='$(OUT_DIR)' \
-    SOURCE_DIR='$(SOURCE_DIR)' REL_DIR='$(REL_DIR)' TYPE='$(TYPE)' \
-    $(SUB_TARGET)
+_GM_SUBMAKE = $(MAKE) -C $(SOURCE_DIR) -f env.mk -f $($(1)_mkfile) -f $(call TARGET_RULES_FOR,$(TYPE)) \
+    $(foreach v,$(_GM_SUBMAKE_VARS) $(_GM_SUBMAKE_VARS_$(TYPE)),$(v)=$(call _sq,$($(v)))) $(2)
 ```
 
-- `BUILD_DIR / OUT_DIR / SOURCE_DIR / REL_DIR / TYPE` are passed on
-  the sub-make's cmdline.  These get **cmdline-override** semantics
-  in the sub-make — they beat any `:=` assignment in target.c.mk /
-  target.go.mk / etc.
-- `$(SUB_TARGET)` is the sub-make's goal (empty = default = build the
-  target; `clean` / `check` for other flows — see env.mk's SUB_TARGET
-  whitelist).
+- `_GM_SUBMAKE_VARS` (env.mk) is what EVERY sub-make gets -- env.mk and flags.mk run in all of
+  them: `PROJ_TOP ADMIN_DIR BUILD_ARCH BUILD_MODE SANITIZE COVERAGE GM_MACHINE C_PATH CC_PATH
+  GM_OUT GM_TOP_MAKEFILES DEP_TREE TARGET_DEP TYPE SOURCE_DIR BUILD_DIR OUT_DIR REL_DIR _GM_JQ`
+  (jq: DEP_TREE in every type).  `_GM_SUBMAKE_VARS_<type>` adds what one type uses: C
+  (lib / exe / test) `_GM_CCACHE BUILD_HOST`, go `_GM_GO`, java `_GM_JAVAC _GM_JAR`, pkg
+  `_GM_RPMBUILD _GM_UNAME_M _GM_RPM_DIST BUILD_HOST`; import none.  A C sub-make sees no go
+  probe (check 17 leg L).  Everything the top level derived and the sub-makes must agree on is
+  in them: the
+  variant axes (a top-level `COVERAGE := 1` used to make the top level name a `-cov` build dir
+  the sub-make never created), the compilers flags.mk resolved in the top-level make (`C_PATH` /
+  `CC_PATH`; `GM_MACHINE` was asked from them -- a `CC` set in the top-level Makefile reaches
+  every target this way).  Values go through `_sq`.
+- Only short values.  A list that grows with the tree never goes on a command line (it would
+  also ride in MAKEFLAGS into every child's environment): `TARGET_ALL` and `GM_SYS_LIBS`, which
+  only the DRY_RUN sub-makes use, are written by project.mk to `$(GM_OUT)/.dry-run-vars.mk`
+  (only when the content changes) and included by env.mk when `DRY_RUN=1` in a sub-make.
+- These are passed on the sub-make's cmdline, so they get **cmdline-override**
+  semantics: they beat any `:=` assignment in target.c.mk / target.go.mk / ...  And they
+  reach every make the sub-make starts, in MAKEFLAGS and in the environment: target.import.mk
+  removes them from both (`MAKEOVERRIDES` filter + `unexport`) so a vendor's own make does not
+  get gm's `BUILD_DIR` / `TYPE` / ... imposed on its variables of the same name; it gets gm's
+  compilers instead as `CC` / `CXX` in its environment (a default the vendor's own `CC :=`
+  still beats).
+- `$(SUB_TARGET)` is the sub-make's goal (empty = build the target;
+  `clean` otherwise — see env.mk's SUB_TARGET whitelist).
 
-### 9.2 Environment inheritance (env.mk's `export` list)
+### 9.2 MAKEFLAGS and the environment
 
-`env.mk` L246-249:
+- Variables given on the command line (`DRY_RUN=1`, `WARN_LEVEL=...`,
+  `CC=...`) ride in `MAKEFLAGS` into every child make; that is how
+  `DRY_RUN` reaches the leaf without being in `_GM_SUBMAKE_VARS`
+  (docs/3-DRY_RUN.md).  A makefile assignment never beats a cmdline value.
+- Two channels, chosen by what a target's `.mk` may do with the value (env.mk, above
+  `_GM_SUBMAKE_VARS`).  Command line: must agree, cannot be changed by a `.mk`.  Environment
+  (`export`): project defaults a `.mk` may still change -- flags.mk's `PROJECT_* WARN_LEVEL
+  HARDEN CXX_STD PATH_MAP` (an assignment in the `.mk` beats the environment; `CXX_STD :=
+  c++20` per target relies on that) -- and what tools other than make read: `SOURCE_DATE_EPOCH`
+  (gcc, rpmbuild, jar), `GM_TREE`, `CC` / `CXX` for a vendor's make.  Nothing else is exported;
+  target-specific variables never leave the top-level make.
+- `GM_TREE`: the top-level Makefile reads it from the environment BEFORE env.mk's `export
+  GM_TREE := 1` (an assignment beats the environment, so from then on this make and everything
+  it starts see 1).  A nested `make` of a gm tree therefore finds 1 and stops; gm's own
+  re-entries start with `GM_TREE= $(MAKE) ...` (empty in their environment) and pass.  On the
+  command line it would beat the assignment and switch the guard off: refused.
 
-```make
-export PROJ_TOP ADMIN_DIR BUILD_ARCH BUILD_MODE DEP_TREE DRY_RUN
-export GM_OUT GM_LIB_DIR GM_EXEC_DIR GM_PKG_DIR GM_JAVA_DIR
-export GM_GEN_DIR GM_COVERAGE_DIR GM_RELEASE_DIR GM_DEP_FILE GM_PKG_OF_FILE
-export GM_FRAMEWORK_CORE_MK
-```
+### 9.3 Validation runs in every make instance
 
-These become **shell env vars** whenever a recipe runs.  When that
-recipe calls `$(MAKE)`, the sub-make imports them as make variables
-with `origin=environment` — lower priority than cmdline, but higher
-than `:=` assignments in the sub-make.
-
-**The DRY_RUN trick that isn't obvious**:
-
-```make
-# project.mk
-deps: DRY_RUN := 1
-deps:
-	@for t in $(TARGET_PKG) ; do $(MAKE) -s $$t ; done
-```
-
-`DRY_RUN := 1` here is a **target-specific variable**.  It's only
-visible during `deps:`'s recipe.  Combined with `export DRY_RUN` in
-env.mk, **target-specific values ARE exported to the recipe's shell
-env** (GNU Make §5.7.2).  So the sub-make spawned by
-`$(MAKE) -s $$t` reads `DRY_RUN=1` from env → target.c.mk's
-`ifeq ($(DRY_RUN),1)` matches → dry-run branch fires.
-
-Verify:
-
-```
-$ DRY_RUN=1 make -f production/make/env.mk -f- <<< '$$(info origin=$$(origin DRY_RUN))'
-origin=environment
-```
-
-**Consequence**: don't add `DRY_RUN :=` (unconditional) anywhere in
-env.mk or target.*.mk.  It would beat the env-inherited value in the
-sub-make and break dry-run derivation.
-
-### 9.3 `MAKELEVEL` gate for validation
-
-The legality-guard block at the top of env.mk (§2.1) is wrapped in:
-
-```make
-ifeq ($(MAKELEVEL),0)
-    ... validation ...
-endif
-```
-
-Rationale: sub-makes ALSO parse env.mk (via target.common.mk), and we
-don't want the deprecation warning about `o=` to fire once per sub-
-make invocation.  MAKELEVEL is a make built-in: 0 at top level, 1 in
-a first-level `$(MAKE)`-launched child, etc.  Top-level Makefile
-validates once; sub-makes trust the (already-validated) values
-forwarded to them via §9.1 / §9.2.
+env.mk's legality guards (§2.1, §14) are cheap and not gated on `MAKELEVEL`:
+every sub-make re-validates the values forwarded via §9.1.
 
 ---
 
@@ -560,13 +687,18 @@ user's .mk plus `$(CURRENT_FILE)` (which is target.c.mk, not flags.mk).
 `env.mk` defines the **core framework files**:
 
 ```make
-GM_FRAMEWORK_CORE_MK := \
-    $(PROJ_TOP)/Makefile      \
+GM_FRAMEWORK_CORE_MK = \
+    $(GM_TOP_MAKEFILES)       \
     $(ADMIN_DIR)/make/env.mk  \
     $(ADMIN_DIR)/make/flags.mk \
     $(ADMIN_DIR)/make/project.mk \
     $(ADMIN_DIR)/make/target.common.mk
 ```
+
+`GM_TOP_MAKEFILES` are the project's own makefiles the top-level make read: the one it was
+started with (gm's `Makefile`, or the project's own one that includes env.mk) and everything
+that one includes, i.e. `MAKEFILE_LIST` without gm's `make/` files and what lives under
+`GM_OUT`.  Computed in the top-level make, passed down in `_GM_SUBMAKE_VARS`.
 
 Each `target.<TYPE>.mk` extends this with its type-specific set:
 
@@ -596,7 +728,7 @@ reports every downstream target.
 **What's deliberately EXCLUDED from `GM_FRAMEWORK_CORE_MK`**:
 
 - **User's `.mk` files** — per-target; already a prereq of just their
-  own target.  A change to `libt2.mk` should invalidate libt2, not
+  own target.  A change to `libtmstats.mk` should invalidate libtmstats, not
   everything.
 - **Dispatch-only files** — `incremental.mk` / `coverage.mk` /
   `test.mk` / `target.dry-run.mk`.  These add phonies (`refresh`,
@@ -650,45 +782,51 @@ The **auto-inheritance** flow:
    `DRY_DEPS` (the intree libs/exes the pkg bundles), it upserts
    `PKG_OF_<d> := <pkg-name>` into `$(GM_OUT)/pkg_of.mk`.
 3. **`make deps` phase 2** runs libs/exes/tests.  Their sub-makes
-   load env.mk which `-include`s pkg_of.mk → variables like
-   `PKG_OF_libt2 = "pkg-p2"` are in scope.
-4. **`target.c.mk`** consults them:
+   load env.mk, which `-include`s pkg_of.mk in a target sub-make
+   (read only) → variables like
+   `PKG_OF_libtmstats = "pkg-tmd pkg-tm-devel"` are in scope.
+4. **`target.c.mk`** consults them when the `.mk` asks for it:
    ```make
-   PKG_HEADERS ?=
-   ifeq ($(strip $(PKG_HEADERS)),)
-   PKG_HEADERS := $(PKG_OF_$(TARGET))    # auto-fill
+   ifeq ($(PKG_HEADERS),yes)
+   PKG_HEADERS := $(PKG_OF_$(TARGET))    # every pkg that ships this target
    endif
    ```
-   User can override by hand-writing `PKG_HEADERS := pkg-p2` in the
-   lib.mk.
+   Unset means no coupling.  A target no pkg ships (a test, the generated alarm library)
+   names the pkg instead: `PKG_HEADERS := pkg-tmd` (_pkg_alarm.mk does this).
 5. **PKG_HEADERS drives**:
    - `-I $(GM_GEN_DIR)/<pkg>` (short include form:
      `#include <component.h>`)
    - `$(OBJS): $(GM_GEN_DIR)/<pkg>/component.h` (obj prereq)
    - DRY_DEPS gets `<pkg>-header` appended → depend.mk chains
-     `libt2: pkg-p2-header` so a cold clone builds the header
+     `libtmstats: pkg-tmd-header pkg-tm-devel-header` so a cold clone builds the header
      phony first (fast: no rpmbuild, just pkg-build.py + a sed).
 6. **`make-versionstamp.sh`** compiles the pkg's macros
    (`NAME`, `PKG_VERSION`, `MAJOR_VERSION`, ...) into a
    `strings`-recoverable global in every consumer's artefact.
+7. **component.h is remade from all its inputs**: pkg.yaml, pkg-build.py, and the values the
+   pkg's `.mk` (or the command line) passes -- `PKG_VERSION`, the release, `PKG_YAML_VARS`,
+   `PKG_INSTALL_ROOT` -- through a `_FLAG_STAMP` (`$(GM_GEN_DIR)/<pkg>/.values`).  It used to
+   depend on pkg.yaml alone: a new PKG_VERSION left every binary with the old macros (check 17
+   leg T).  The stamp sits next to the header because every variant shares the header; one per
+   BUILD_DIR would regenerate it for each variant in turn and recompile the others' consumers.
 
 ### Multi-pkg headers — how a lib in two pkgs sees both identities
 
-**Question**: if `libt2` is bundled by BOTH `pkg-p1` AND `pkg-p2`
-(both XML-mode), does libt2 embed both pkgs' versions?
+**Question**: `libtmstats` is bundled by BOTH `pkg-tmd` AND `pkg-tm-devel` (both YAML-mode);
+does it embed both pkgs' versions?
 
 **Answer**: yes.  Three coordinated pieces make it work:
 
 **1. `pkg-build.py`'s `component.h` emits ONLY PREFIXED macros**:
 
-   `P2_NAME`, `P2_PKG_VERSION`, `P2_MAJOR_VERSION`, `P2_UNIQUE_COMPONENT_ID`,
+   `TMD_NAME`, `TMD_PKG_VERSION`, `TMD_MAJOR_VERSION`, `TMD_UNIQUE_COMPONENT_ID`,
    ...  Prefix derived from the pkg name's last dot/hyphen segment,
-   uppercased (`pkg-p2` → `P2`, `Component.HssServer.pcgw` → `PCGW`).
+   uppercased (`pkg-tmd` → `TMD`, `pkg-tm-devel` → `DEVEL`, `Component.HssServer.pcgw` → `PCGW`).
 
    Per-pkg include guard `COMPONENT_H_<PREFIX>_INCLUDED` protects
    the same pkg's header from being double-included.  Different pkgs'
    headers coexist in one TU with zero risk of macro collision —
-   they live in disjoint namespaces (`P1_*` vs `P2_*`).
+   they live in disjoint namespaces (`TMD_*` vs `DEVEL_*`).
 
    **Design choice**: no unprefixed back-compat aliases.  While gm
    is pre-1.0, we require explicit prefixes so users learn the
@@ -699,7 +837,7 @@ The **auto-inheritance** flow:
 **2. `target.dry-run.mk`'s reverse-map hook uses APPEND-TO-LIST**:
 
    ```
-   PKG_OF_libt2 := pkg-p1 pkg-p2       # both owners
+   PKG_OF_libtmstats := pkg-tmd pkg-tm-devel       # both owners
    ```
 
    Order is deterministic (sorted `TARGET_PKG`).  Idempotent: adding
@@ -710,46 +848,45 @@ The **auto-inheritance** flow:
 
    ```make
    # target.c.mk
-   PKG_HEADERS := $(PKG_OF_$(TARGET))    # = "pkg-p1 pkg-p2"
+   PKG_HEADERS := $(PKG_OF_$(TARGET))    # = "pkg-tmd pkg-tm-devel"
    _PKG_HEADER_FILES := $(foreach p,$(PKG_HEADERS),$(GM_GEN_DIR)/$(p)/component.h)
    CCFLAGS += $(foreach p,$(PKG_HEADERS),-I$(GM_GEN_DIR)/$(p)) -I$(GM_GEN_DIR)
    ```
 
    Note `-I$(GM_GEN_DIR)` (unqualified parent dir) is ALSO added so
-   users can write `#include <pkg-p1/component.h>` regardless of
+   users can write `#include <pkg-tmd/component.h>` regardless of
    how many pkg headers they consume.
 
    `make-versionstamp.sh` `#include`s each pkg-header and emits one
    identity block per pkg:
 
    ```c
-   #include <pkg-p1/component.h>
-   #include <pkg-p2/component.h>
+   #include <pkg-tmd/component.h>
+   #include <pkg-tm-devel/component.h>
 
-   const char *__gm_versionstamp_libt2__ =
+   const char *__gm_versionstamp_libtmstats__ =
        "GM_VERSIONSTAMP:"
-       " target=libt2 ..."
-       " pkg=" P1_PKG_NAME " ver=" P1_PKG_VERSION " (" P1_PKG_RELEASE ")"
-       " pkg=" P2_PKG_NAME " ver=" P2_PKG_VERSION " (" P2_PKG_RELEASE ")"
+       " target=libtmstats ..."
+       " pkg=" TMD_PKG_NAME " ver=" TMD_PKG_VERSION " (" TMD_PKG_RELEASE ")"
+       " pkg=" DEVEL_PKG_NAME " ver=" DEVEL_PKG_VERSION " (" DEVEL_PKG_RELEASE ")"
        "";
    ```
 
-**Result**: `strings libt2.so | grep GM_VERSIONSTAMP:` prints one
+**Result**: `strings libtmstats.so | grep GM_VERSIONSTAMP:` prints one
 line with both pkgs' identity concatenated.
 
-**Lib-author pattern**:
+**Lib-author pattern** (example/stats/src/window.cxx):
 
 ```c
-#include <pkg-p1/component.h>
-#include <pkg-p2/component.h>
+#include <pkg-tm-devel/component.h>
+#include <pkg-tmd/component.h>
 
-const char *v1 = P1_PKG_VERSION;   // "1.0"
-const char *v2 = P2_PKG_VERSION;   // "2.5.1"
-int major1     = P1_MAJOR_VERSION; // 1
-int major2     = P2_MAJOR_VERSION; // 2
+const char *v1 = TMD_PKG_VERSION;     // "1.4.0"
+const char *v2 = DEVEL_PKG_VERSION;   // "1.4.0"
+int major      = TMD_MAJOR_VERSION;   // 1
 ```
 
-Always use the pkg-qualified include (`<pkg-p2/component.h>`) and
+Always use the pkg-qualified include (`<pkg-tmd/component.h>`) and
 the prefixed macros.  No ambiguity, no order dependence.
 
 ---
@@ -766,28 +903,32 @@ For consistency with `container/` (which vendors `pydep/` and
 - `production/tools/dep-hooks.sh` — canonical location of the cp/install
   wrapper for capture-during-copy.  `container/` sources it directly.
   Both callers use `realpath -s` (not `realpath`), preserving symlinks
-  so `$(GM_LIB_DIR)/libt2.so` doesn't resolve down to a per-target
+  so `$(GM_LIB_DIR)/libtmstats.so` doesn't resolve down to a per-target
   BUILD_DIR path.
 
 ---
 
 ## 14. Legality guards — what env.mk refuses
 
-At parse time (top-level only, MAKELEVEL=0):
+At parse time (every make instance, §9.3):
 
 - `SUB_TARGET=<value>` — whitelist `clean` (empty = default).  `check`
   was previously accepted but every per-type implementation had drifted
   from its designed purpose (artefact-diff against a reference build);
   all removed pending a re-implementation.  See env.mk's design note
   next to `SUB_TARGET_VALID`.
-- `BUILD_MODE=<value>` — whitelist `debug release coverage`
+- `BUILD_MODE=<value>` — whitelist `debug release`
   (extend via `GM_VALID_MODES += <name>` in the project Makefile
   BEFORE including env.mk).
+- `SANITIZE=<set>` — comma list of `address undefined thread` (empty =
+  off); unknown entries and `address`+`thread` are refused.  `COVERAGE` —
+  empty / `0` / `no` / `1` / `yes`.  Every output dir, `BUILD_DIR` and
+  `%/$(GM_MODE_DIR)` mkdir rule goes through `GM_MODE_DIR`, so instrumented
+  and plain objects never share a directory (§6.1).
 - `MAKECMDGOALS` mixing `lib*` + `pkg*` — refused (they're different
   DAG tiers; run separately for explicit ordering).  DRY_RUN dispatch
   is exempt (dep-derivation legitimately needs both).
-- `o=<value>` — deprecated alias for `SUB_TARGET=`, emits warning +
-  forwards.
+- `o=<value>` — alias for `SUB_TARGET=`.
 
 Every guard emits an error message that names the invalid value AND
 tells the user how to fix / extend.
@@ -837,7 +978,13 @@ Checks (as of writing):
 5. Shellcheck     (every `.sh`)
 6. Actionlint     (`.github/workflows/*.yml`)
 7. Jq syntax      (`production/make/scripts/*.jq`)
-8. gm smoke       (`make list-targets` sees every example target)
+8. gm smoke       (`make list` sees every example target)
+9. nested-gm guard, duplicate basenames, bad LDLIBS, idempotence, compile database
+10. build variants (`SANITIZE` / `COVERAGE` axes, per-mode flags, hardening)
+11. compiler selection (`CC` / `CXX` / `PATH`, ccache shims skipped)
+12. `gm core|watch|symbols` against tiny crash programs (needs gdb + Python; skipped otherwise)
+13. build regressions in a scratch copy (phony target names, sub-dir sources, quoting, per-target
+    clean, optional jq, toolchain gating, rpmbuild log tail, concurrent makes)
 
 Add a new check = write a `check_<name>` bash function in
 precheck.sh, register in `ALL_CHECKS`.  Nothing else changes.

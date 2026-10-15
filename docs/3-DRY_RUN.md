@@ -1,13 +1,36 @@
 # DRY_RUN 依赖生成机制
 
-`gm` 用 **DRY_RUN 模式**在每次 `make` 前重建三份 build artefact：
+`gm` 用 **DRY_RUN 模式**在构建目标之前按需重建三份 build artefact（合称依赖图）：
 
-- `build/depend.mk` —— lib 级依赖锁文件（`t3: libt1 libt2` 这种边）
-- `build/pkg_of.mk` —— lib → pkg 反查表（`PKG_OF_libt2 := pkg-p2`）
+- `build/depend.mk` —— lib 级依赖锁文件（`tmctl: libtmcore` 这种边）
+- `build/pkg_of.mk` —— lib → pkg 反查表（`PKG_OF_libtmstats := pkg-tmd pkg-tm-devel`）
 - `build/import_of.mk` —— vendor artefact → 拥有它的 `.import.mk`
-  反查表（`IMPORT_OF_libvlib_extra := libvlib`）
+  反查表（`IMPORT_OF_libminijson_file := libminijson`）
 
-三份都在 `build/` 下、gitignore，从不需要手工维护。
+三份都在 `build/` 下、gitignore，从不需要手工维护。重建规则和顶层的 include 在
+[`graph.mk`](../production/make/graph.mk) 里（只由 Makefile include 一次）：
+
+| 文件 | 谁读 | 怎么读 |
+|------|------|--------|
+| `depend.mk` | 顶层 make（构建顺序） | Makefile 在 project.mk 之后 include graph.mk |
+| `pkg_of.mk`、`import_of.mk` | target 子 make（`PKG_HEADERS := yes`、pkg.yaml 里的 vendor artefact） | env.mk 在子 make 里直接 `-include`，只读，子 make 里没有重建它们的规则 |
+
+### 哪些 goal 加载依赖图
+
+GNU make 在处理任何 goal **之前**先重建所有被 include 的 makefile，所以只要
+include 了 `depend.mk`，它一过时就会全树扫描，不管 goal 是什么。graph.mk 因此只在
+goal 会在本进程里构建目标时 include 它：
+
+- **加载**：目标名、`run-<t>`、`<pkg>-header`、`all`、`test`、`show*`、
+  `compile_commands`，以及项目自己 Makefile 里的 goal（默认都加载，永远正确）
+- **不加载**：project.mk 的 `_GM_GOALS_ALONE` —— 只读文件（`list`、`help`、
+  `changes`、`deps-files`…）、不需要顺序（`clean`、`distclean`），或者自己再起一个
+  make 的 goal（`coverage`、`refresh`、`incremental`、`deps`，由里层 make 加载）；
+  以及 env.mk `SUB_TARGET_ALONE` 里的子 goal（`make <t> SUB_TARGET=clean`）
+
+新加一个 gm goal 时，登记进 `_GM_GOALS`（防止和目标重名，本来就要登记）的两栏之一即可，
+不需要另写 `ifneq ($(MAKECMDGOALS),...)`。漏登记的后果只是多一次扫描。
+`make prereq` 就是靠这个在新机器上先装 PyYAML / jsonschema，而不是先去扫 pkg.yaml。
 
 本文只讲**机制**——怎么触发、怎么传递、每一代做什么。用法层面
 的「什么时候需要 `make deps`」在 [`1-USER_GUIDE.md`](1-USER_GUIDE.md) §5。
@@ -20,42 +43,41 @@
 Gen-1 (最外层, 用户敲的 make)
  │  $(DRY_RUN) 未设
  │  include env.mk    → DRY_RUN 仍未设
- │  include project.mk → 定义 $(TARGET_DEP) 规则（在 ifneq ($(DRY_RUN),1) 里）
- │  Makefile:19-23     -include $(TARGET_DEP)   ← depend.mk
+ │  include project.mk → 找出 TARGET_ALL_MK
+ │  include graph.mk   → goal 要构建目标时（不在 _GM_GOALS_ALONE 里）：
+ │                       定义 $(TARGET_DEP) 规则，include $(TARGET_DEP)   ← depend.mk
  │  ────────────────────────────────────────────
  │  makefile-remake 触发（GNU make 特性）
  │  ────────────────────────────────────────────
  │  被 include 的文件本身也是 target；depend.mk 缺失或过时时，
  │  make 会先执行它的规则、跑完再从零 parse 一遍主 Makefile
  │
- │  规则命中 project.mk:108
+ │  规则命中 graph.mk
  │  $(TARGET_DEP): $(TARGET_ALL_MK)
  │      recipe 是 for-loop：
  │
- │      for t in libvlib vtool pkg-p1 pkg-p2 ... ; do
+ │      for t in loadgen libminijson pkg-tmd pkg-tm-devel ... ; do
  │          GM_TREE= $(MAKE) -s DRY_RUN=1 $$t   ← 每个变更 target 一次
  │      done
  │
  ↓  ── 这里 fork 出 Gen-2 (每个变更 target 一次，串行) ──
-Gen-2 (每个变更 target 一次) : GM_TREE= make -s DRY_RUN=1 libt1
+Gen-2 (每个变更 target 一次) : GM_TREE= make -s DRY_RUN=1 libtmcore
  │  没有 -C / -f → 重新加载顶层 Makefile
  │  DRY_RUN=1 是命令行显式参数 → 自动进入 MAKEFLAGS
  │
  │  include env.mk    → DRY_RUN=1 可见
  │  include project.mk
- │  │  这次 `ifneq ($(DRY_RUN),1)` 门禁生效，
- │  │  $(TARGET_DEP) 规则 NOT 重新定义
- │  │  → 切断「Gen-2 又去 rebuild depend.mk」的死循环风险
- │  Makefile:19-23 ifneq ($(DRY_RUN),1)
- │  │  include $(TARGET_DEP) 也被跳过
- │  │  → makefile-remake 不再触发
+ │  include graph.mk
+ │  │  这次 `ifneq ($(DRY_RUN),1)` 门禁生效：
+ │  │  $(TARGET_DEP) 规则不定义，也不 include depend.mk
+ │  │  → makefile-remake 不触发，切断「Gen-2 又去 rebuild depend.mk」的死循环风险
  │
- │  goal = libt1，命中 Makefile:61 的 $(TARGET_ALL) 分发规则
- │  recipe: $(MAKE) -C $(SOURCE_DIR) -f env.mk -f libt1.mk -f target.c.mk ...
+ │  goal = libtmcore，命中 Makefile 的 $(TARGET_ALL) 分发规则
+ │  recipe: $(MAKE) -C $(SOURCE_DIR) -f env.mk -f libtmcore.mk -f target.c.mk ...
  │
  ↓  ── fork Gen-3 (真正做 DRY_RUN 工作的那一代) ──
 Gen-3 (真正做 DRY_RUN 的那一层)
- │  make -C example/t1 -f env.mk -f libt1.mk -f target.c.mk
+ │  make -C example/core -f env.mk -f libtmcore.mk -f target.c.mk
  │  DRY_RUN=1 通过 MAKEFLAGS 环境**自动继承**（Gen-2 命令行 → MAKEFLAGS → Gen-3 环境）
  │
  │  target.c.mk 顶端：
@@ -94,11 +116,12 @@ Gen-3 (真正做 DRY_RUN 的那一层)
  │
  │  .DEFAULT_GOAL := all         ← 用户敲 make 时的默认 goal
  │  include env.mk              ← 加载所有默认 + 工具路径 + flags.mk
- │  include project.mk          ← 定义 TARGET_ALL_MK + $(TARGET_DEP) 规则
- │  
- │  ifneq ($(DRY_RUN),1)         ← DRY_RUN 未设 → 走这一支
- │  -include $(TARGET_DEP)       ← 尝试 include build/depend.mk
- │  endif
+ │  include project.mk          ← 定义 TARGET_ALL_MK、_GM_GOALS_ALONE
+ │  include graph.mk
+ │  │  ifneq ($(DRY_RUN),1)       ← DRY_RUN 未设 → 走这一支
+ │  │  goal 不全在 _GM_GOALS_ALONE 里 → 定义 $(TARGET_DEP) 规则
+ │  │  include $(TARGET_DEP)      ← 尝试 include build/depend.mk
+ │  │  endif
  ↓
 ```
 
@@ -118,11 +141,11 @@ Gen-3 (真正做 DRY_RUN 的那一层)
 对应到 depend.mk：**冷 clone 时缺失 → makefile-remake 触发；任何一个
 `.mk` 文件被 touch 后 depend.mk 过时 → 同样触发**。
 
-命中的规则在 [`project.mk:108`](../production/make/project.mk#L108)：
+命中的规则在 [`graph.mk`](../production/make/graph.mk)：
 
 ```make
 $(TARGET_DEP): $(TARGET_ALL_MK)
-	@mkdir -p $(@D)
+	@mkdir -p $(@D) && touch $(GM_PKG_OF_FILE) $(GM_IMPORT_OF_FILE)
 	@$(call V_DEPS,scanning $(words $(_CHANGED)) target(s))
 	@for t in $(_ORDERED) ; do \
 	    $(ECHO) "  DEPS    $$t" ; \
@@ -157,17 +180,17 @@ $(TARGET_DEP): _ORDERED = \
 
 ```
 [顺序 1: imports]
- │  libvlib.import.mk 可能产出 libvlib.so + libvlib_extra.so + vtool2 三份
+ │  libminijson.import.mk 产出 libminijson.so / .a + libminijson_file.so + jsonpp
  │  DRY_RUN 写：
- │      IMPORT_OF_libvlib       := libvlib
- │      IMPORT_OF_libvlib_extra := libvlib
- │      IMPORT_OF_vtool         := vtool
+ │      IMPORT_OF_libminijson      := libminijson
+ │      IMPORT_OF_libminijson_file := libminijson
+ │      IMPORT_OF_jsonpp           := libminijson
  │  到 import_of.mk
  ↓
 [顺序 2: pkgs]
- │  pkg.yaml files: [$GM_LIB_DIR/libvlib_extra.so] 
- │  → 通过 IMPORT_OF_libvlib_extra 反查到 libvlib
- │  同时写 PKG_OF_libt2 := pkg-p2 到 pkg_of.mk
+ │  pkg-tmd 的 pkg.yaml files: [$GM_LIB_DIR/libminijson_file.so]
+ │  → 通过 IMPORT_OF_libminijson_file 反查到 libminijson
+ │  同时写 PKG_OF_libtmstats := pkg-tmd 到 pkg_of.mk
  ↓
 [顺序 3: 其它]
  │  lib / exe / test / go / java 可能 PKG_HEADERS := pkg-<name>
@@ -184,10 +207,10 @@ $(TARGET_DEP): _ORDERED = \
 Gen-2 的 recipe 是：
 
 ```
-GM_TREE= make -s DRY_RUN=1 libt1
+GM_TREE= make -s DRY_RUN=1 libtmcore
         └────────────────┴──────── 关键 3 件事
                 │            │
-                │            └── goal = libt1（要 sed 的那一个 target）
+                │            └── goal = libtmcore（要 sed 的那一个 target）
                 └── DRY_RUN=1 是命令行显式参数
                     ↓
                     自动进入 MAKEFLAGS （GNU make 特性）
@@ -206,23 +229,17 @@ fork 一个 make 进程从零加载顶层**。
  │  │  │  DRY_RUN=1 通过 MAKEFLAGS 可见
  │  │  
  │  │  include project.mk
+ │  │  include graph.mk
  │  │  │  ifneq ($(DRY_RUN),1)       ← DRY_RUN=1 → 门禁生效
- │  │  │      $(TARGET_DEP) 规则不定义       
+ │  │  │      $(TARGET_DEP) 规则不定义，不 include depend.mk
  │  │  │  endif
- │  │  │  → **切断递归风险**：Gen-2 内部再 include depend.mk 
- │  │  │    也不会触发 makefile-remake
- │  │  
- │  │  Makefile:19-23
- │  │  │  ifneq ($(DRY_RUN),1)
- │  │  │      -include $(TARGET_DEP)
- │  │  │  endif
- │  │  │  → 同样跳过，不 include depend.mk
+ │  │  │  → **切断递归风险**：Gen-2 不会触发 makefile-remake
  │
- │  goal = libt1 → 命中 $(TARGET_ALL) 分发规则
+ │  goal = libtmcore → 命中 $(TARGET_ALL) 分发规则
  │
  │  分发规则 recipe：
- │      $(MAKE) -C example/t1 \
- │              -f env.mk -f libt1.mk -f target.c.mk \
+ │      $(MAKE) -C example/core \
+ │              -f env.mk -f libtmcore.mk -f target.c.mk \
  │              PROJ_TOP=... BUILD_MODE=... TYPE=lib SOURCE_DIR=... 
  │      └── 这里 fork Gen-3
 ```
@@ -238,19 +255,18 @@ OUT_DIR` 等值准备好，然后传给 Gen-3。
 Gen-3 是分发器 fork 出来的，参数是分发器组装好的：
 
 ```
-make -C example/t1 \
+make -C example/core \
      -f env.mk \                     ← 框架默认 + flags.mk
-     -f libt1.mk \                   ← 用户 knobs（CXXSOURCE, LDLIBS, ...）
+     -f libtmcore.mk \               ← 用户 knobs（CXXSOURCE, LDLIBS, ...）
      -f target.c.mk \                ← 编译规则（含 target.common.mk）
      PROJ_TOP=... BUILD_MODE=... TYPE=lib BUILD_DIR=... ...
 ```
 
-注意分发器 `_GM_CMDLINE_ROOT` 里**没有 DRY_RUN**：
+注意分发器转发的变量清单 `_GM_SUBMAKE_VARS`（env.mk）里**没有 DRY_RUN**：
 
 ```make
-_GM_CMDLINE_ROOT := PROJ_TOP='$(PROJ_TOP)' ADMIN_DIR='$(ADMIN_DIR)' \
-                    BUILD_ARCH='$(BUILD_ARCH)' BUILD_MODE='$(BUILD_MODE)' \
-                    GM_OUT='$(GM_OUT)' DEP_TREE='$(DEP_TREE)'
+_GM_SUBMAKE_VARS := PROJ_TOP ADMIN_DIR BUILD_ARCH BUILD_MODE SANITIZE COVERAGE GM_MACHINE C_PATH CC_PATH \
+                    GM_OUT DEP_TREE TARGET_DEP TYPE SOURCE_DIR BUILD_DIR OUT_DIR REL_DIR
                     ▲
                     │ 没有 DRY_RUN，为什么？
                     ▼
@@ -259,7 +275,7 @@ _GM_CMDLINE_ROOT := PROJ_TOP='$(PROJ_TOP)' ADMIN_DIR='$(ADMIN_DIR)' \
 **因为 GNU make 会自动把命令行变量塞进 `MAKEFLAGS`**：
 
 ```
-Gen-2 启动：  make -s DRY_RUN=1 libt1
+Gen-2 启动：  make -s DRY_RUN=1 libtmcore
                         ▲
                         │ 命令行变量
                         ▼
@@ -275,6 +291,13 @@ Gen-3 启动：  make -C ...     (子进程环境里 MAKEFLAGS 存在)
 
 这是命令行传参优于 `export`：**不需要每层 recipe 都记得转发新加的
 开关**。想加个新的 flag，命令行传就行，中间层自动带上。
+
+反过来，这也是**长列表不能走命令行**的原因：命令行变量会进 `MAKEFLAGS`，
+也就进了 Gen-3 起每个子进程（包括每次编译器调用）的环境。Gen-3 判断
+"`-lfoo` 是不是树内目标"要用到的 `TARGET_ALL`（以及 `LDLIB_CHECK=1` 时的
+`GM_SYS_LIBS`，系统库名清单，本机近 10 KB）随目录树增长，所以 Gen-2 在解析
+project.mk 时把它们写进 `$(GM_OUT)/.dry-run-vars.mk`，Gen-3 的 env.mk 只在
+`DRY_RUN=1` 且自己是子 make 时 `include` 它。
 
 Gen-3 加载完 3 个 makefile 之后：
 
@@ -338,7 +361,7 @@ target.import.mk: 不产 DRY_DEPS 边
 for-loop 结束之后，Gen-1 的 `$(TARGET_DEP)` recipe 还有后半段：
 
 ```
-[project.mk:115-125]
+[graph.mk，$(TARGET_DEP) recipe 后半段]
  │
  │  sort -u pkg_of.mk         → 去重、排序
  │  sort -u import_of.mk      → 去重、排序
@@ -354,11 +377,11 @@ makefile-remake 结束
  ↓
 GNU make 从零重新 parse 顶层 Makefile
  ↓
-[Makefile:19-23 再次跑]
+[graph.mk 再次跑]
  │  ifneq ($(DRY_RUN),1)     ← 未设，走这一支
  │  include $(TARGET_DEP)     ← 这次能成功
  │  ifneq ($(_DEP_DIGEST),$(_DEP_DIGEST_NOW))  ← 二次比对 digest
- │      $(shell $(RM) $(TARGET_DEP) $(GM_PKG_OF_FILE))
+ │      $(shell $(RM) $(TARGET_DEP) $(GM_PKG_OF_FILE) $(GM_IMPORT_OF_FILE))
  │      → 说明 .mk 列表变了（add/delete）但 auto-regen 没跟上
  │      → 干掉 depend.mk，makefile-remake 会再触发一次
  │  endif
@@ -381,7 +404,7 @@ GNU make 从零重新 parse 顶层 Makefile
 │       │                                │                              │ 结束后 sort/dedupe/写 _DEP_DIGEST         │
 ├───────┼────────────────────────────────┼──────────────────────────────┼──────────────────────────────────────────┤
 │ Gen-2 │ GM_TREE= make -s               │ 命令行显式设                 │ 重入顶层 Makefile                        │
-│       │ DRY_RUN=1 <target>             │ (project.mk 的 for 循环)     │ project.mk 的 ifneq 门禁避免死循环        │
+│       │ DRY_RUN=1 <target>             │ (graph.mk 的 for 循环)       │ graph.mk 的 ifneq 门禁避免死循环          │
 │       │ (每个变更 target 一次)         │                              │ 分发器把 target 派给 Gen-3               │
 ├───────┼────────────────────────────────┼──────────────────────────────┼──────────────────────────────────────────┤
 │ Gen-3 │ make -C <src>                  │ MAKEFLAGS 环境**自动继承**   │ target.<type>.mk 里 ifeq ($(DRY_RUN),1)  │
@@ -408,7 +431,7 @@ make deps
 make deps
  │
  ↓
-[project.mk:127-129]
+[graph.mk]
  │  @$(RM) $(TARGET_DEP) $(GM_PKG_OF_FILE) $(GM_IMPORT_OF_FILE)
  │  @GM_TREE= $(MAKE) $(TARGET_DEP)
  │             │
@@ -465,6 +488,6 @@ cat build/pkg_of.mk build/import_of.mk
 
 看某个 target 的 DRY_DEPS
     ↓
-make libt1 DRY_RUN=1 -s
+make libtmcore DRY_RUN=1 -s
     └── 单独跑一遍，观察它写到 depend.mk 的哪一行
 ```

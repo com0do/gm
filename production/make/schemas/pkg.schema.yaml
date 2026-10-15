@@ -43,6 +43,24 @@ additionalProperties: false
 # and fail loudly when a config accidentally drops the list.
 required: [pkg, files]
 
+# --- reusable shapes ------------------------------------------------------
+$defs:
+  # A path the package owns without carrying a file: `dirs` (a %dir entry, created empty) and
+  # `ghosts` (a %ghost entry: not in the payload, owned and removed with the package).
+  path_entry:
+    oneOf:
+      - type:        string
+        pattern:     '^/'
+        description: 'absolute path; mode 0755 root:root for dirs, 0644 root:root for ghosts.'
+      - type:                 object
+        required:             [path]
+        additionalProperties: false
+        properties:
+          path:  {type: string, pattern: '^/'}
+          mode:  {type: string, pattern: '^[0-7]{3,4}$'}
+          owner: {type: string}
+          group: {type: string}
+
 # --- property definitions ---------------------------------------------
 properties:
 
@@ -55,6 +73,16 @@ properties:
     type:        string
     description: Human-readable summary; ends up as the RPM Summary line.
     default:     ''
+
+  license:
+    type:        string
+    description: RPM License tag.
+    default:     Proprietary
+
+  group:
+    type:        string
+    description: RPM Group tag (newer rpm ignores it; kept for older consumers).
+    default:     Networking
 
   pkg_type:
     type:        string
@@ -79,6 +107,57 @@ properties:
     description: RPM-level `Requires:` entries.
     items:       {type: string}
     default:     []
+
+  # -------------------------------------------------------------------
+  # More RPM tags.  All optional; empty means "tag not emitted".
+  # -------------------------------------------------------------------
+  epoch:    {type: string, pattern: '^[0-9]*$', default: '', description: 'RPM Epoch.'}
+  url:      {type: string, default: '', description: 'RPM URL tag.'}
+  vendor:   {type: string, default: '', description: 'RPM Vendor tag.'}
+  packager: {type: string, default: '', description: 'RPM Packager tag.'}
+  provides:  {type: array, items: {type: string}, default: [], description: 'Provides: entries.'}
+  conflicts: {type: array, items: {type: string}, default: [], description: 'Conflicts: entries.'}
+  obsoletes: {type: array, items: {type: string}, default: [], description: 'Obsoletes: entries.'}
+  requires_pre:   {type: array, items: {type: string}, default: [], description: 'Requires(pre): entries.'}
+  requires_post:  {type: array, items: {type: string}, default: [], description: 'Requires(post): entries.'}
+  requires_preun: {type: array, items: {type: string}, default: [], description: 'Requires(preun): entries.'}
+  requires_postun: {type: array, items: {type: string}, default: [], description: 'Requires(postun): entries.'}
+  autoreqprov:
+    type:        boolean
+    default:     false
+    description: |
+      rpm's automatic dependency / provide generation (AutoReqProv).  Off by default: the
+      package then declares only what `rpm_deps` / `requires_*` / `provides` say.
+
+  # -------------------------------------------------------------------
+  # Scriptlets.  Each value is a shell script (interpreter /bin/sh).  `%` is an rpm macro
+  # character: write `%%` for a literal one.  `$$` gives a literal `$` (single `$NAME` is
+  # replaced by --vars when NAME is known).
+  # -------------------------------------------------------------------
+  scripts:
+    type:                 object
+    description:          Package scriptlets.
+    additionalProperties: false
+    default:              {}
+    properties:
+      pretrans:  {type: string}
+      pre:       {type: string}
+      post:      {type: string}
+      preun:     {type: string}
+      postun:    {type: string}
+      posttrans: {type: string}
+
+  dirs:
+    type:        array
+    description: 'Directories the package owns (%dir), created empty.'
+    default:     []
+    items:       {$ref: '#/$defs/path_entry'}
+
+  ghosts:
+    type:        array
+    description: 'Files the package owns but does not carry (%ghost -- pid files, caches, generated config).'
+    default:     []
+    items:       {$ref: '#/$defs/path_entry'}
 
   install_root:
     type:        string
@@ -208,6 +287,14 @@ properties:
                 description: 'Per-file mode override.'
               owner: {type: string, description: 'Per-file owner override.'}
               group: {type: string, description: 'Per-file group override.'}
+              flags:
+                type:        array
+                description: |
+                  rpm %files directives: `config` (%config), `noreplace` / `missingok` (attributes
+                  of %config, imply it), `doc` (%doc), `license` (%license).
+                items:
+                  enum: [config, noreplace, missingok, doc, license]
+                uniqueItems: true
 
   # -------------------------------------------------------------------
   # alarms: enum table shipped as an autogenerated C++ library.

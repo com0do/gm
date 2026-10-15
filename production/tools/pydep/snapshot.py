@@ -82,10 +82,10 @@ def _target_name(data: dict[str, Any], dep_json: Path) -> str:
 
     Precedence:
       1. `pkg` / `img` field  -- semantic label from the source data.
-      2. `file` field basename minus `.so` / `.a` / `.jar` (`libt2.so`
-         -> `libt2`; `t3` -> `t3`).  Preferred over the raw dep.json
+      2. `file` field basename minus `.so` / `.a` / `.jar` (`libtmstats.so`
+         -> `libtmstats`; `tmd` -> `tmd`).  Preferred over the raw dep.json
          filename because some target types add an internal
-         disambiguation tag (`t3.exe.dep.json` when a target and its
+         disambiguation tag (`tmd.exe.dep.json` when a target and its
          `.o` share the same basename -- see target.c.mk's
          `_DEP_JSON_TAG` logic).
       3. Fallback: dep.json filename minus the two trailing extensions.

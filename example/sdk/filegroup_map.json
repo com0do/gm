@@ -1,0 +1,4 @@
+{
+  "Headers":          { "dir": "include/tm", "mode": "0444", "owner": "root", "group": "root" },
+  "Static_Libraries": { "dir": "lib",        "mode": "0444", "owner": "root", "group": "root" }
+}

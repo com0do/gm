@@ -1,0 +1,73 @@
+# yaml-language-server: $schema=../../../production/make/schemas/pkg.schema.yaml
+#
+# pkg-tmd -- the telemetry daemon's rpm.  Only `pkg` and `files` are required; every other field
+# has a default in production/make/schemas/pkg.schema.yaml (install_root /opt/gm, the
+# filegroup -> directory map, ...).  `$$` writes a literal `$` into a scriptlet.
+
+pkg:         pkg-tmd
+description: telemetry daemon -- sliding windows, thresholds, alarms, JSON snapshots
+license:     MIT
+url:         https://example.com/gm/tmd
+provides:    [telemetry-daemon = 1.4]
+conflicts:   [tmd-legacy]
+
+scripts:
+  post: |
+    # a real package would enable its service here
+    echo "pkg-tmd installed under $${RPM_INSTALL_PREFIX:-/opt/gm}" >/dev/null
+  postun: |
+    [ "$$1" -ge 1 ] || rm -rf /var/lib/tmd/snapshots
+dirs:
+  - /var/lib/tmd
+  - {path: /var/log/tmd, mode: '0750', owner: root, group: root}
+ghosts:
+  - /var/run/tmd.pid
+
+# Becomes build/gen/include/<arch>/pkg-tmd/component.h (TMD_NAME, TMD_PKG_VERSION, ...).
+component:
+  name:          gm/example/tmd
+  id:            '000.004.001.000.000.000'
+  major_version: '1'
+  minor_version: '4'
+  comp_type:     application
+
+files:
+  Binaries64:
+    - $GM_EXEC_DIR/tmd
+  Impl_Libraries64:
+    - $GM_LIB_DIR/libtmstats.so
+    - $GM_LIB_DIR/libminijson.so
+    # Built by libminijson's vendor Makefile: gm maps the name back to that target.
+    - $GM_LIB_DIR/libminijson_file.so
+  Config_OS:
+    - src:   $PROJ_TOP/example/daemon/deploy/tmd.conf
+      flags: [config, noreplace]
+
+# Becomes libtmalarms (example/daemon/alarms): alarms.h with an enum and a table.
+alarms:
+  - name:             TmConfigMissing
+    number:           '5101'
+    alarm_type:       PROCESSING
+    severity:         MINOR
+    suppression_time: '0'
+    short_text:       tmd started without its configuration file
+    long_text:        tmd could not open its configuration file and runs with the built-in defaults, without thresholds.
+    repair_text:      Install tmd.conf (pkg-tmd ships one under config/) or pass --config.
+
+  - name:             TmInputMalformed
+    number:           '5102'
+    alarm_type:       PROCESSING
+    severity:         WARNING
+    suppression_time: '60'
+    short_text:       tmd skipped input lines that are not `metric value`
+    long_text:        At least one input line did not have exactly a metric name and a number.  The snapshot counts them.
+    repair_text:      Check the producer of the samples.
+
+  - name:             TmThresholdExceeded
+    number:           '5103'
+    alarm_type:       QUALITY_OF_SERVICE
+    severity:         MAJOR
+    suppression_time: '30'
+    short_text:       a metric is above its threshold
+    long_text:        A sample of the metric was above the limit set in [thresholds] of tmd.conf.  The alarm clears with the next sample at or below the limit.
+    repair_text:      Find out what drives the metric up, or raise the limit if it is too low.

@@ -1,12 +1,12 @@
 # _pkg_alarm.mk - alarm-lib boilerplate.  Emits `alarms.h` + `alarms.cxx`
 # under $(GM_GEN_DIR)/$(_ALARM_PKG)/ from the pkg's `alarms:` YAML.
 # Usage in a consumer .mk (typically `<pkg-srcdir>/alarms/libNAME.mk`):
-#     _ALARM_PKG      := pkg-p2
+#     _ALARM_PKG      := pkg-tmd
 #     _ALARM_PKG_YAML := $(dir $(lastword $(MAKEFILE_LIST)))../deployment/pkg.yaml
 #     include $(ADMIN_DIR)/make/_pkg_alarm.mk
 
 ifeq ($(strip $(_ALARM_PKG)),)
-$(error _pkg_alarm.mk: _ALARM_PKG must be set (e.g. `_ALARM_PKG := pkg-p2`))
+$(error _pkg_alarm.mk: _ALARM_PKG must be set (e.g. `_ALARM_PKG := pkg-tmd`))
 endif
 ifeq ($(strip $(_ALARM_PKG_YAML)),)
 $(error _pkg_alarm.mk: _ALARM_PKG_YAML must be set (path to the pkg's pkg.yaml))
@@ -35,3 +35,13 @@ $(_ALARM_CXX): $(_ALARM_PKG_YAML) $(ADMIN_DIR)/make/scripts/pkg-build.py \
 	    --alarms-out $(_ALARM_OUT_DIR) >/dev/null
 
 $(_ALARM_H): $(_ALARM_CXX) ;
+
+# DEP_TREE=yes: dep.json of the generated files, so the file-level graph runs pkg.yaml -> alarms.*
+# -> this library.  target.c.mk builds whatever _GM_GEN_DEP_JSON lists with the target's own.
+ifeq ($(DEP_TREE),yes)
+_GM_GEN_DEP_JSON += $(_ALARM_CXX).dep.json $(_ALARM_H).dep.json
+$(_ALARM_CXX).dep.json $(_ALARM_H).dep.json: %.dep.json: %
+	$(V_JSON)
+	$(Q)printf '%s\n' $(abspath $(_ALARM_PKG_YAML)) $(ADMIN_DIR)/make/scripts/pkg-build.py \
+	    $(ADMIN_DIR)/make/schemas/pkg.schema.yaml | jq -R . | jq -s --arg f '$*' '{file: $$f, deps: .}' > $@
+endif

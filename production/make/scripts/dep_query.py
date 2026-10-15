@@ -118,7 +118,7 @@ def cmd_show(args: argparse.Namespace) -> int:
         }, indent=2, max_line_length=120))
         return 0
     # tree-ish text
-    for kind in (Kind.IMG, Kind.PKG, Kind.EXE, Kind.LIB, Kind.JAVA, Kind.OBJ):
+    for kind in (Kind.IMG, Kind.PKG, Kind.EXE, Kind.LIB, Kind.JAVA, Kind.OBJ, Kind.GEN):
         by = sorted(a for a, info in graph.artifacts.items() if info["kind"] == kind)
         if not by:
             continue

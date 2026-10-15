@@ -1,0 +1,14 @@
+/* tm_build.h -- generated from tm_build.h.in by gm (HEADER_GEN in libtmcore.mk).
+ * TARGET, BUILD_MODE, BUILD_ARCH, BUILD_DATE and BUILD_HOST are always substituted; the .mk adds
+ * PROJECT_VERSION through HEADER_GEN_VARS. */
+#ifndef TM_BUILD_H
+#define TM_BUILD_H
+
+#define TM_BUILD_TARGET "@TARGET@"
+#define TM_VERSION      "@PROJECT_VERSION@"
+#define TM_BUILD_MODE   "@BUILD_MODE@"
+#define TM_BUILD_ARCH   "@BUILD_ARCH@"
+#define TM_BUILD_DATE   "@BUILD_DATE@"
+#define TM_BUILD_HOST   "@BUILD_HOST@"
+
+#endif

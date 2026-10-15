@@ -15,24 +15,21 @@
 # set here (there's no single yang schema to point at; the config
 # tree is a union).  Use ./tools/validate.sh for full-fidelity checks.
 
-pkg-p2:
+pkg-tmd:
   config:
     # gmc:process-identity
-    name:              "pkg-p2-default"
+    name:              "pkg-tmd-default"
     log-level:         INFO
 
-    # backend HTTP endpoint (gmc:http-endpoint)
-    backend:
-      host:            "backend.svc.cluster.local"
-      port:            8080
-      timeout-ms:      5000
+    # the [daemon] section of tmd.conf
+    window:            120
+    report-every:      0
 
-    # pkg-specific knobs
-    max-inflight:      128
-    feature-flag-experimental-x: false
-
-    # routing table: one default catch-all
-    route:
-      - prefix:        "/"
-        upstream:      "backend-primary"
-        weight:        100
+    # the [thresholds] section of tmd.conf
+    threshold:
+      - metric:        "cpu.load"
+        limit:         0.90
+      - metric:        "disk.used_pct"
+        limit:         95
+      - metric:        "temp.celsius"
+        limit:         80

@@ -14,7 +14,7 @@
 gm: libutil must be unique.
 ```
 
-（错误定义在 [`production/make/project.mk`](../production/make/project.mk#L17-L20)
+（错误定义在 [`production/make/project.mk`](../production/make/project.mk#L20-L23)
 的 `_TARGET_DUPES` 检查里，`grep -n libutil` 一下能立刻定位到冲突路径。）
 
 「同名」指的是**去掉 `.mk` 后缀之后的 basename**：
@@ -22,6 +22,15 @@ gm: libutil must be unique.
 ```
 example/component1/libutil.mk   →  target 名 = libutil
 example/component2/libutil.mk   →  target 名 = libutil    ← 撞了
+```
+
+同理，target 名也不能和 gm 自己的命令重名（`all clean deps list show run test coverage
+refresh ...`、类型名 `lib exe go java pkg import-lib import-exe`（`show-<type>`），以及另一个
+target 的 `show-<t>` / `run-<t>`），否则会被命令遮住；
+`make` 同样拒绝启动（`_TARGET_CLASH`）：
+
+```
+gm: target name(s) show clash with gm's own goals; rename the .mk file(s).
 ```
 
 ---
@@ -66,7 +75,7 @@ gm 把名字和文件绑一起，直接得到 4 个 UX 简化：
 ┌──────────────┐              ┌──────────────────┐              ┌────────────────┐
 │ LDLIBS 零配置 │              │ depend.mk 纯短名 │              │ 打平输出目录合法 │
 │              │              │                  │              │                │
-│ LDLIBS +=    │              │ t3: libt1 libt2  │              │ ls $GM_LIB_DIR │
+│ LDLIBS +=    │              │ tmctl: libtmcore │              │ ls $GM_LIB_DIR │
 │    -lt2      │              │                  │              │ → 一眼所有 .so │
 │              │              │ 一行看懂         │              │                │
 │ 无需映射表   │              │                  │              │ 无子目录       │
@@ -178,7 +187,7 @@ Usage: mytool [component2 options]   ← 用户永远不知道自己在跑哪个
 - **用户认知模型崩塌**：如果一个项目有两个 `mytool`，那这个 `mytool`
   这个名字**没有单一含义**。用户读日志、看 `ps`、写 systemd unit
   文件时，`mytool` 指代什么？看情况——「情况」是构建时的偶然。
-- **打包时 rpm 冲突**：`pkg-p1` 和 `pkg-p2` 都想放 `/opt/gm/bin/mytool`。
+- **打包时 rpm 冲突**：`pkg-tmd` 和 `pkg-tm-tools` 都想放 `/opt/gm/bin/mytool`。
   用 rpm-file-diff 一装立刻报错。
 - **文档和错误消息互相拆台**：`ERROR in mytool` 用户查 wiki，wiki
   上的 `mytool` 是另一个组件的。

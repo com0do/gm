@@ -8,13 +8,13 @@ LABEL org.opencontainers.image.title="@TARGET@" \
       org.opencontainers.image.source="gm @BUILD_MODE@/@BUILD_ARCH@"
 
 # Build context (populated by target.img.mk via dep-hooks):
-#   pkg-p1-*.rpm  -- our packaged binaries + config
+#   pkg-tm-tools-*.rpm  -- tmctl, packaged from the gm tree
 #   entrypoint.sh -- launcher script
 
-COPY pkg-p1-*.rpm entrypoint.sh /tmp/
+COPY pkg-tm-tools-*.rpm entrypoint.sh /tmp/
 
-RUN rpm -ivh --nodeps /tmp/pkg-p1-*.rpm && \
+RUN rpm -ivh --nodeps /tmp/pkg-tm-tools-*.rpm && \
     install -m 0755 /tmp/entrypoint.sh /usr/local/bin/entrypoint && \
-    rm -f /tmp/pkg-p1-*.rpm /tmp/entrypoint.sh
+    rm -f /tmp/pkg-tm-tools-*.rpm /tmp/entrypoint.sh
 
 ENTRYPOINT ["/usr/local/bin/entrypoint"]

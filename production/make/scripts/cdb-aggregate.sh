@@ -3,10 +3,11 @@
 #
 # cdb-aggregate.sh -- fold *.cc.json fragments into compile_commands.json.
 #
-# Usage: cdb-aggregate.sh <gm-out-dir> <output-json> <symlink-path> [proj-top]
+# Usage: cdb-aggregate.sh [--check] <gm-out-dir> <output-json> <symlink-path> [proj-top]
 #
 # Idle-fast: exits early when the DB is newer than every fragment, so a
 # no-op `make` doesn't rescan the tree.  Empty tree yields a `[]` DB.
+# --check: write nothing, exit 0 when the DB is current and 1 when not (`make -q`).
 #
 # Also merges vendor-provided compile DBs from third_party/**/
 # compile_commands.json (produced by `bear -- make` or CMake's
@@ -14,6 +15,15 @@
 # last-wins on collision.
 
 set -eu
+
+check=
+if [ "${1:-}" = --check ]; then
+    check=1
+    shift
+fi
+
+# jq is optional: without it the build still works, there is just no compile_commands.json.
+command -v jq >/dev/null 2>&1 || { [ -n "$check" ] || echo '  CDB     skipped (jq not found)'; exit 0; }
 
 gm_out=$1
 out=$2
@@ -34,6 +44,7 @@ if [ -f "$out" ]; then
     done
     [ -z "$newer_frag" ] && [ -z "$newer_vend" ] && exit 0
 fi
+[ -z "$check" ] || exit 1
 
 mkdir -p "$(dirname "$out")"
 

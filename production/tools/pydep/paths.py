@@ -23,8 +23,8 @@ def normalize(path: str, proj_top: Path) -> str:
     running through DepGraph.load() -> normalize() collapses OUT_DIR
     views to their BUILD_DIR realpath here.  Result: every artefact
     key in the loaded graph is a real disk path, so a lib's dep.json
-    (`file: OUT_DIR/libt2.so`) and its consumer's deps[]
-    (`deps: [... OUT_DIR/libt2.so ...]`) both hash to the SAME
+    (`file: OUT_DIR/libtmstats.so`) and its consumer's deps[]
+    (`deps: [... OUT_DIR/libtmstats.so ...]`) both hash to the SAME
     BUILD_DIR key, and adjacency lookups just work.
 
     Relative paths become absolute via `proj_top` first; then

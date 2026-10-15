@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 #
 # target.java.mk -- Java sub-target rules; simple javac + jar cf.  Not maven/gradle.
-# Knobs (all optional): JAVASOURCE, MAIN_CLASS, JAR_DEPS (in-tree,
+# A java target is a `<name>.java.mk`.  JAVASOURCE (required) lists its .java files.
+# Knobs (optional): MAIN_CLASS, JAR_DEPS (in-tree,
 # like LDLIBS), CLASSPATH (external), JAVAC_FLAGS, JAR_FLAGS,
 # JAVA_SRC_ROOTS (fed to depjava.py's class-index).  DEP_TREE=yes ->
 # depjava.py builds {file,deps} by parsing imports (there is no
@@ -10,12 +11,13 @@
 
 CURRENT_FILE := $(lastword $(abspath $(MAKEFILE_LIST)))
 MAKEFILE     := $(lastword $(filter-out $(ADMIN_DIR)/make/% ,$(abspath $(MAKEFILE_LIST))))
-TARGET       := $(basename $(notdir $(MAKEFILE)))
+TARGET       := $(patsubst %.java,%,$(basename $(notdir $(MAKEFILE))))
 MAKEFILE_DIR := $(abspath $(dir $(MAKEFILE)))
 
 GM_FRAMEWORK_MK := $(GM_FRAMEWORK_CORE_MK) \
     $(CURRENT_FILE) \
-    $(ADMIN_DIR)/make/scripts/depjava.py
+    $(ADMIN_DIR)/make/scripts/depjava.py \
+    $(ADMIN_DIR)/make/scripts/jar-normalize.py
 
 include $(ADMIN_DIR)/make/target.common.mk
 
@@ -27,18 +29,23 @@ include $(ADMIN_DIR)/make/target.dry-run.mk
 else
 
 
-JAVAC          ?= $(firstword $(shell command -v javac 2>/dev/null) javac)
-JAR            ?= $(firstword $(shell command -v jar    2>/dev/null) jar)
-
-# Auto-discover .java under MAKEFILE_DIR if JAVASOURCE not set.
-JAVASOURCE     ?= $(shell find $(MAKEFILE_DIR) -name '*.java' -type f 2>/dev/null)
+# JAVAC / JAR: env.mk.  JAVASOURCE: the .mk lists its sources (relative to its dir, or absolute),
+# like CXXSOURCE -- declared, not searched.
+JAVASOURCE     := $(foreach f,$(JAVASOURCE),$(if $(filter /%,$(f)),$(f),$(MAKEFILE_DIR)/$(f)))
 ifeq ($(strip $(JAVASOURCE)),)
-$(error target.java.mk: no .java files found under $(MAKEFILE_DIR).  Set JAVASOURCE in $(MAKEFILE) if the sources live elsewhere.)
+$(error $(MAKEFILE): JAVASOURCE is empty -- list the .java files this jar is built from)
+endif
+_JAVA_MISSING  := $(filter-out $(wildcard $(JAVASOURCE)),$(JAVASOURCE))
+ifneq ($(_JAVA_MISSING),)
+$(error $(MAKEFILE): JAVASOURCE file(s) not found: $(patsubst $(MAKEFILE_DIR)/%,%,$(_JAVA_MISSING)))
 endif
 
 JAR_DEPS       ?=
 CLASSPATH      ?=
 JAVAC_FLAGS    ?=
+# Class-file level (default 8 runs on every JRE >= 8, whichever JDK built it).
+JAVA_RELEASE   ?= 8
+_JAVAC_TARGET  := -source $(JAVA_RELEASE) -target $(JAVA_RELEASE) -encoding UTF-8 -Xlint:-options
 JAR_FLAGS      ?=
 MAIN_CLASS     ?=
 JAVA_SRC_ROOTS ?= $(MAKEFILE_DIR)
@@ -90,20 +97,27 @@ $(GEN_MANIFEST): $(MAKEFILE) $(CURRENT_FILE) | $(BUILD_DIR)
 $(JAR_OUT): $(JAVASOURCE) $(INTREE_JARS) $(GEN_MANIFEST) $(MAKEFILE) $(GM_FRAMEWORK_MK) | $(BUILD_DIR) $(OUT_DIR)
 	$(V_JAVAC)
 	$(Q)$(RM) -r $(CLASS_DIR) ; $(MKDIR) $(CLASS_DIR)
-	$(Q)$(JAVAC) $(JAVAC_FLAGS) -d $(CLASS_DIR) $(JAVAC_CLASSPATH) $(JAVASOURCE)
+	$(Q)$(JAVAC) $(JAVAC_FLAGS) $(_JAVAC_TARGET) -d $(CLASS_DIR) $(JAVAC_CLASSPATH) $(JAVASOURCE)
 	$(V_JAR)
 	$(Q)$(JAR) cfm $@ $(GEN_MANIFEST) $(JAR_FLAGS) -C $(CLASS_DIR) .
+	$(Q)$(if $(SOURCE_DATE_EPOCH),python3 $(ADMIN_DIR)/make/scripts/jar-normalize.py $@ $(SOURCE_DATE_EPOCH),:)
+
+# make -n on a variant not built yet: the JAR_DEPS sub-makes only printed their recipes, so
+# their jars are not on disk; the empty rule only stands in for a missing jar.
+ifneq ($(_GM_MAKE_N),)
+$(INTREE_JARS): ;
+endif
 
 
-.PRECIOUS: %/$(BUILD_MODE) $(OUT_DIR)
-%/$(BUILD_MODE):
+.PRECIOUS: %/$(GM_MODE_DIR) $(OUT_DIR)
+%/$(GM_MODE_DIR):
 	$(Q)$(MKDIR) $@
 $(OUT_DIR):
 	$(Q)$(MKDIR) $@
 
 
 # DEP_TREE=yes: depjava.py builds the class index from JAVA_SRC_ROOTS,
-# walks imports, emits {file, deps}.  --intree-jar wires j1.jar -> j2
+# walks imports, emits {file, deps}.  --intree-jar wires tmapi.jar -> tmview
 # edges (mirrors LDLIBS on the C side).
 $(DEP_JSON_LINK): $(JAR_OUT) $(GM_FRAMEWORK_MK)
 	$(V_JSON)
@@ -123,6 +137,13 @@ clean:
 	$(Q)$(RM) -r $(CLASS_DIR)
 	$(Q)$(RM) $(GEN_MANIFEST) $(JAR_OUT) $(DEP_JSON_LINK)
 	$(V_CLEAN)
+
+GM_SHOW_FIELDS := output jar-deps classpath main-class release
+SHOW_output     = $(call _rel,$(JAR_OUT))
+SHOW_jar-deps   = $(or $(JAR_DEPS),-)
+SHOW_classpath  = $(or $(CLASSPATH),-)
+SHOW_main-class = $(or $(MAIN_CLASS),- (library jar))
+SHOW_release    = $(JAVA_RELEASE)
 
 
 endif # DRY_RUN
